@@ -1,314 +1,3423 @@
-# Commodity PRO Trader Assistant v1
-# Standalone Streamlit app for MCX commodity futures using Upstox APIs.
-# Required Streamlit secret: UPSTOX_ACCESS_TOKEN
-# Run: streamlit run Commodity_PRO_Trader_Assistant_v1.py
+```python
+# ================================================================
+# COMMODITY PRO TRADER ASSISTANT
+# MCX COMMODITY OPTIONS ONLY
+#
+# Upstox + Streamlit
+#
+# IMPORTANT:
+# This application DOES NOT resolve or trade MCX futures.
+# It finds MCX CE/PE option contracts directly.
+#
+# Required Streamlit Secret:
+# UPSTOX_ACCESS_TOKEN = "your_upstox_access_token"
+#
+# Run:
+# streamlit run app.py
+# ================================================================
 
 import time
 import threading
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
-from typing import Any, Optional
+from typing import Dict, List, Any
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Commodity PRO Trader Assistant", page_icon="🛢️", layout="wide")
+
+# ================================================================
+# PAGE
+# ================================================================
+
+st.set_page_config(
+    page_title="Commodity PRO Trader Assistant",
+    page_icon="🛢️",
+    layout="wide",
+)
+
+
+# ================================================================
+# CONSTANTS
+# ================================================================
 
 API_BASE = "https://api.upstox.com"
 IST = ZoneInfo("Asia/Kolkata")
+
 API_LOCK = threading.Lock()
-MIN_API_GAP = 0.50
-_LAST_API_CALL = 0.0
+LAST_API_CALL = 0.0
+MIN_API_GAP = 0.45
+
+
+# ================================================================
+# COMMODITY ALIASES
+# ================================================================
 
 ALIASES = {
-    "CRUDE": "CRUDEOIL", "CRUDE OIL": "CRUDEOIL", "CRUDEOIL": "CRUDEOIL",
-    "NATURAL GAS": "NATURALGAS", "NAT GAS": "NATURALGAS", "NATGAS": "NATURALGAS",
-    "GOLD": "GOLD", "SILVER": "SILVER", "COPPER": "COPPER", "ZINC": "ZINC",
-    "ALUMINIUM": "ALUMINIUM", "ALUMINUM": "ALUMINIUM", "LEAD": "LEAD", "NICKEL": "NICKEL",
+    "GOLD": "GOLD",
+    "GOLDM": "GOLDM",
+    "GOLD MINI": "GOLDM",
+    "GOLDMINI": "GOLDM",
+
+    "SILVER": "SILVER",
+    "SILVERM": "SILVERM",
+    "SILVER MINI": "SILVERM",
+    "SILVERMINI": "SILVERM",
+
+    "CRUDE": "CRUDEOIL",
+    "CRUDE OIL": "CRUDEOIL",
+    "CRUDEOIL": "CRUDEOIL",
+
+    "CRUDE OIL MINI": "CRUDEOILMINI",
+    "CRUDEOILMINI": "CRUDEOILMINI",
+
+    "NATURAL GAS": "NATURALGAS",
+    "NATURAL GAS": "NATURALGAS",
+    "NAT GAS": "NATURALGAS",
+    "NATGAS": "NATURALGAS",
+
+    "COPPER": "COPPER",
+    "ZINC": "ZINC",
+    "ALUMINIUM": "ALUMINIUM",
+    "ALUMINUM": "ALUMINIUM",
+    "LEAD": "LEAD",
+    "NICKEL": "NICKEL",
 }
 
-COMMON = ["CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER", "ZINC", "ALUMINIUM", "LEAD", "NICKEL"]
+
+# ================================================================
+# HELPERS
+# ================================================================
+
+def now_ist():
+    return datetime.now(IST)
 
 
-def now_ist(): return datetime.now(IST)
-
-def sf(v, default=np.nan):
+def safe_float(value, default=np.nan):
     try:
-        x = float(v)
-        return x if np.isfinite(x) else default
+        if value is None:
+            return default
+
+        x = float(value)
+
+        if np.isfinite(x):
+            return x
+
+        return default
+
     except Exception:
         return default
 
-def money(v):
-    x = sf(v)
-    return "—" if not np.isfinite(x) else f"₹{x:,.2f}"
 
-def num(v, d=2):
-    x = sf(v)
-    return "—" if not np.isfinite(x) else f"{x:,.{d}f}"
+def fmt_number(value, decimals=2):
+    x = safe_float(value)
 
-def normalize(q):
-    raw = " ".join(str(q or "").strip().upper().split())
-    return ALIASES.get(raw, raw.replace(" ", ""))
+    if not np.isfinite(x):
+        return "—"
+
+    return f"{x:,.{decimals}f}"
 
 
-def token():
-    t = st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
-    if not t:
-        raise RuntimeError("UPSTOX_ACCESS_TOKEN is missing. Add it under Streamlit Secrets.")
-    return str(t).strip()
+def fmt_money(value, decimals=2):
+    x = safe_float(value)
+
+    if not np.isfinite(x):
+        return "—"
+
+    return f"₹{x:,.{decimals}f}"
 
 
-def api_get(path, params=None, timeout=20):
-    global _LAST_API_CALL
+def normalize_symbol(value):
+    raw = " ".join(
+        str(value or "").strip().upper().split()
+    )
+
+    return ALIASES.get(
+        raw,
+        raw.replace(" ", "")
+    )
+
+
+def normalize_text(value):
+    return "".join(
+        ch for ch in str(value or "").upper()
+        if ch.isalnum()
+    )
+
+
+def get_token():
+    try:
+        token = st.secrets.get(
+            "UPSTOX_ACCESS_TOKEN",
+            ""
+        )
+    except Exception:
+        token = ""
+
+    token = str(token).strip()
+
+    if not token:
+        raise RuntimeError(
+            "UPSTOX_ACCESS_TOKEN is missing. "
+            "Add your Upstox access token in Streamlit Secrets."
+        )
+
+    return token
+
+
+# ================================================================
+# UPSTOX API
+# ================================================================
+
+def api_get(
+    path,
+    params=None,
+    timeout=30
+):
+    global LAST_API_CALL
+
     with API_LOCK:
-        gap = time.time() - _LAST_API_CALL
-        if gap < MIN_API_GAP: time.sleep(MIN_API_GAP - gap)
-        r = requests.get(API_BASE + path, params=params or {}, headers={
-            "Accept": "application/json", "Authorization": f"Bearer {token()}"
-        }, timeout=timeout)
-        _LAST_API_CALL = time.time()
-    if r.status_code == 401: raise RuntimeError("Upstox access token is invalid or expired.")
-    if r.status_code == 429: raise RuntimeError("Upstox API rate limit reached. Please retry shortly.")
-    if not r.ok:
-        try: detail = r.json()
-        except Exception: detail = r.text[:500]
-        raise RuntimeError(f"Upstox API error {r.status_code}: {detail}")
-    return r.json()
+
+        gap = time.time() - LAST_API_CALL
+
+        if gap < MIN_API_GAP:
+            time.sleep(
+                MIN_API_GAP - gap
+            )
+
+        try:
+            response = requests.get(
+                API_BASE + path,
+                params=params or {},
+                headers={
+                    "Accept": "application/json",
+                    "Authorization":
+                        f"Bearer {get_token()}",
+                },
+                timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Unable to connect to Upstox: {exc}"
+            ) from exc
+
+        LAST_API_CALL = time.time()
+
+    if response.status_code == 401:
+        raise RuntimeError(
+            "Upstox access token is invalid or expired. "
+            "Generate a fresh token and update "
+            "UPSTOX_ACCESS_TOKEN."
+        )
+
+    if response.status_code == 429:
+        raise RuntimeError(
+            "Upstox API rate limit reached. "
+            "Please wait a few seconds and try again."
+        )
+
+    if not response.ok:
+
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text[:500]
+
+        raise RuntimeError(
+            f"Upstox API error {response.status_code}: {detail}"
+        )
+
+    try:
+        return response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            "Upstox returned an invalid JSON response."
+        ) from exc
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def instrument_search(q):
-    # The Search Instruments API returns futures contracts matching the search.
-    data = api_get("/v2/instruments/search", {"query": q, "exchanges": "MCX", "segments": "MCX_FO", "page_number": 1, "records": 50})
-    return data.get("data", []) if isinstance(data, dict) else []
+# ================================================================
+# DIRECT MCX OPTION SEARCH
+#
+# IMPORTANT:
+# There is NO futures resolution here.
+# ================================================================
+
+@st.cache_data(
+    ttl=90,
+    show_spinner=False
+)
+def search_mcx_options(
+    symbol,
+    option_type,
+    expiry_keyword
+):
+
+    symbol = normalize_symbol(symbol)
+
+    params = {
+        "query": symbol,
+        "exchanges": "MCX",
+        "segments": "FO",
+        "instrument_types": option_type,
+        "expiry": expiry_keyword,
+        "page_number": 1,
+        "records": 30,
+    }
+
+    payload = api_get(
+        "/v2/instruments/search",
+        params=params,
+        timeout=30,
+    )
+
+    data = payload.get(
+        "data",
+        []
+    )
+
+    if not isinstance(data, list):
+        return []
+
+    return data
 
 
-def resolve_future(query):
-    n = normalize(query)
-    queries = list(dict.fromkeys([query.strip(), n]))
-    all_rows = []
-    for q in queries:
-        if q:
-            try: all_rows += instrument_search(q)
-            except Exception: pass
-    unique = {}
-    for x in all_rows:
-        k = x.get("instrument_key") or x.get("trading_symbol")
-        if k: unique[k] = x
-    rows = list(unique.values())
+def option_matches_commodity(
+    row,
+    symbol,
+    option_type
+):
+
+    if not isinstance(row, dict):
+        return False
+
+    exchange = str(
+        row.get("exchange", "")
+    ).upper()
+
+    segment = str(
+        row.get("segment", "")
+    ).upper()
+
+    instrument_type = str(
+        row.get("instrument_type", "")
+    ).upper()
+
+    if exchange != "MCX":
+        return False
+
+    if segment != "MCX_FO":
+        return False
+
+    if instrument_type != option_type:
+        return False
+
+    target = normalize_text(symbol)
+
+    underlying_symbol = normalize_text(
+        row.get("underlying_symbol", "")
+    )
+
+    trading_symbol = normalize_text(
+        row.get("trading_symbol", "")
+    )
+
+    name = normalize_text(
+        row.get("name", "")
+    )
+
+    short_name = normalize_text(
+        row.get("short_name", "")
+    )
+
+    if underlying_symbol == target:
+        return True
+
+    if target and target in trading_symbol:
+        return True
+
+    if target and target in name:
+        return True
+
+    if target and target in short_name:
+        return True
+
+    return False
+
+
+def expiry_string(value):
+    if not value:
+        return ""
+
+    return str(value)[:10]
+
+
+def clean_options(
+    rows,
+    symbol,
+    option_type
+):
+
     today = date.today().isoformat()
-    rows = [x for x in rows if str(x.get("segment", "")).upper() == "MCX_FO"]
-    rows = [x for x in rows if x.get("expiry") and str(x.get("expiry"))[:10] >= today] or rows
-    rows.sort(key=lambda x: str(x.get("expiry", "9999-99-99")))
-    # Prefer a future instrument. Search result documentation identifies future contracts.
-    fut = [x for x in rows if "FUT" in str(x.get("trading_symbol", "")).upper() or str(x.get("instrument_type", "")).upper() in {"FUTCOM", "FUT"}]
-    return (fut[0] if fut else (rows[0] if rows else None)), rows
+
+    result = []
+
+    for row in rows:
+
+        if not option_matches_commodity(
+            row,
+            symbol,
+            option_type
+        ):
+            continue
+
+        instrument_key = str(
+            row.get("instrument_key", "")
+        ).strip()
+
+        if not instrument_key:
+            continue
+
+        expiry = expiry_string(
+            row.get("expiry")
+        )
+
+        if not expiry:
+            continue
+
+        if expiry < today:
+            continue
+
+        strike = safe_float(
+            row.get("strike_price")
+        )
+
+        if not np.isfinite(strike):
+            continue
+
+        result.append(row)
+
+    return result
 
 
-def quote(key):
-    return api_get("/v3/market-quote/quotes", {"instrument_key": key}).get("data", {})
+def deduplicate_contracts(rows):
+
+    output = {}
+
+    for row in rows:
+
+        key = str(
+            row.get("instrument_key", "")
+        ).strip()
+
+        if key:
+            output[key] = row
+
+    return list(output.values())
 
 
-def extract_quote(data, key):
-    x = data.get(key) if isinstance(data, dict) else None
-    if x is None and data: x = next(iter(data.values()))
-    x = x or {}
-    o = x.get("ohlc") or {}
+# ================================================================
+# RESOLVE MCX OPTIONS DIRECTLY
+#
+# No futures.
+# ================================================================
+
+@st.cache_data(
+    ttl=90,
+    show_spinner=False
+)
+def resolve_mcx_options(symbol):
+
+    symbol = normalize_symbol(symbol)
+
+    if not symbol:
+        raise RuntimeError(
+            "Please enter a commodity."
+        )
+
+    expiry_attempts = [
+        "current_month",
+        "next_month",
+        "near_month",
+        "next_week",
+    ]
+
+    for expiry_keyword in expiry_attempts:
+
+        all_rows = []
+
+        for option_type in ["CE", "PE"]:
+
+            try:
+
+                rows = search_mcx_options(
+                    symbol,
+                    option_type,
+                    expiry_keyword
+                )
+
+                cleaned = clean_options(
+                    rows,
+                    symbol,
+                    option_type
+                )
+
+                all_rows.extend(cleaned)
+
+            except Exception:
+                continue
+
+        all_rows = deduplicate_contracts(
+            all_rows
+        )
+
+        if not all_rows:
+            continue
+
+        expiries = sorted(
+            {
+                expiry_string(
+                    row.get("expiry")
+                )
+                for row in all_rows
+                if expiry_string(
+                    row.get("expiry")
+                )
+            }
+        )
+
+        if not expiries:
+            continue
+
+        selected_expiry = expiries[0]
+
+        selected = [
+            row
+            for row in all_rows
+            if expiry_string(
+                row.get("expiry")
+            ) == selected_expiry
+        ]
+
+        ce_count = sum(
+            1
+            for row in selected
+            if str(
+                row.get("instrument_type", "")
+            ).upper() == "CE"
+        )
+
+        pe_count = sum(
+            1
+            for row in selected
+            if str(
+                row.get("instrument_type", "")
+            ).upper() == "PE"
+        )
+
+        if ce_count == 0 or pe_count == 0:
+            continue
+
+        underlying_key = ""
+
+        for row in selected:
+
+            key = str(
+                row.get("underlying_key", "")
+            ).strip()
+
+            if key:
+                underlying_key = key
+                break
+
+        return {
+            "symbol": symbol,
+            "expiry": selected_expiry,
+            "underlying_key": underlying_key,
+            "contracts": selected,
+        }
+
+    raise RuntimeError(
+        f"Could not find active MCX options for "
+        f"'{symbol}'. "
+        f"Try GOLD, GOLDM, SILVER, SILVERM, "
+        f"CRUDEOIL, CRUDEOILMINI, NATURALGAS, "
+        f"COPPER, ZINC, ALUMINIUM, LEAD or NICKEL."
+    )
+
+
+# ================================================================
+# FULL MARKET QUOTE V3
+# ================================================================
+
+@st.cache_data(
+    ttl=20,
+    show_spinner=False
+)
+def get_quotes(instrument_keys):
+
+    keys = [
+        str(x).strip()
+        for x in instrument_keys
+        if str(x).strip()
+    ]
+
+    keys = list(dict.fromkeys(keys))
+
+    if not keys:
+        return {}
+
+    result = {}
+
+    for start in range(
+        0,
+        len(keys),
+        500
+    ):
+
+        chunk = keys[
+            start:start + 500
+        ]
+
+        payload = api_get(
+            "/v3/market-quote/quotes",
+            params={
+                "instrument_key":
+                    ",".join(chunk)
+            },
+            timeout=30,
+        )
+
+        data = payload.get(
+            "data",
+            {}
+        )
+
+        if isinstance(data, dict):
+
+            for key, value in data.items():
+
+                if isinstance(value, dict):
+                    result[
+                        str(key)
+                    ] = value
+
+    return result
+
+
+# ================================================================
+# OPTION GREEKS
+# ================================================================
+
+@st.cache_data(
+    ttl=20,
+    show_spinner=False
+)
+def get_option_greeks(
+    instrument_keys
+):
+
+    keys = [
+        str(x).strip()
+        for x in instrument_keys
+        if str(x).strip()
+    ]
+
+    keys = list(dict.fromkeys(keys))
+
+    if not keys:
+        return {}
+
+    result = {}
+
+    for start in range(
+        0,
+        len(keys),
+        50
+    ):
+
+        chunk = keys[
+            start:start + 50
+        ]
+
+        payload = api_get(
+            "/v3/market-quote/option-greek",
+            params={
+                "instrument_key":
+                    ",".join(chunk)
+            },
+            timeout=30,
+        )
+
+        data = payload.get(
+            "data",
+            {}
+        )
+
+        if isinstance(data, dict):
+
+            for key, value in data.items():
+
+                if isinstance(value, dict):
+                    result[
+                        str(key)
+                    ] = value
+
+    return result
+
+
+# ================================================================
+# QUOTE PARSER
+# ================================================================
+
+def parse_quote(value):
+
+    if not isinstance(value, dict):
+        value = {}
+
+    ohlc = value.get(
+        "ohlc",
+        {}
+    ) or {}
+
+    depth = value.get(
+        "depth",
+        {}
+    ) or {}
+
+    buy = depth.get(
+        "buy",
+        []
+    ) or []
+
+    sell = depth.get(
+        "sell",
+        []
+    ) or []
+
+    bid = np.nan
+    ask = np.nan
+
+    if buy and isinstance(
+        buy[0],
+        dict
+    ):
+        bid = safe_float(
+            buy[0].get("price")
+        )
+
+    if sell and isinstance(
+        sell[0],
+        dict
+    ):
+        ask = safe_float(
+            sell[0].get("price")
+        )
+
     return {
-        "ltp": sf(x.get("last_price", x.get("ltp"))),
-        "open": sf(o.get("open")), "high": sf(o.get("high")), "low": sf(o.get("low")), "close": sf(o.get("close")),
-        "volume": sf(x.get("volume", o.get("volume")), 0), "oi": sf(x.get("oi")), "previous_oi": sf(x.get("previous_oi", x.get("prev_oi"))),
-        "prev_close": sf(x.get("prev_close_price", o.get("close"))),
+        "ltp": safe_float(
+            value.get("last_price")
+        ),
+
+        "open": safe_float(
+            ohlc.get("open")
+        ),
+
+        "high": safe_float(
+            ohlc.get("high")
+        ),
+
+        "low": safe_float(
+            ohlc.get("low")
+        ),
+
+        "close": safe_float(
+            ohlc.get("close")
+        ),
+
+        "volume": safe_float(
+            value.get(
+                "volume",
+                ohlc.get(
+                    "volume"
+                )
+            ),
+            0
+        ),
+
+        "oi": safe_float(
+            value.get("oi")
+        ),
+
+        "previous_oi": safe_float(
+            value.get(
+                "previous_oi",
+                value.get("prev_oi")
+            )
+        ),
+
+        "bid": bid,
+        "ask": ask,
     }
 
 
-def candles(key, unit, interval, days_back):
-    end = date.today().isoformat()
-    start = (date.today() - timedelta(days=days_back)).isoformat()
-    enc = requests.utils.quote(key, safe="")
-    path = f"/v3/historical-candle/{enc}/{unit}/{interval}/{end}/{start}"
-    raw = api_get(path)
-    rows = raw.get("data", {}).get("candles", [])
-    out = []
-    for c in rows:
-        if len(c) < 6: continue
-        out.append({"timestamp": pd.to_datetime(c[0], errors="coerce"), "open": sf(c[1]), "high": sf(c[2]), "low": sf(c[3]), "close": sf(c[4]), "volume": sf(c[5], 0), "oi": sf(c[6]) if len(c) > 6 else np.nan})
-    df = pd.DataFrame(out)
-    if df.empty: return df
-    return df.dropna(subset=["timestamp", "close"]).sort_values("timestamp").reset_index(drop=True)
+def parse_greek(value):
+
+    if not isinstance(value, dict):
+        value = {}
+
+    return {
+        "delta": safe_float(
+            value.get("delta")
+        ),
+
+        "gamma": safe_float(
+            value.get("gamma")
+        ),
+
+        "theta": safe_float(
+            value.get("theta")
+        ),
+
+        "vega": safe_float(
+            value.get("vega")
+        ),
+
+        "iv": safe_float(
+            value.get("iv")
+        ),
+
+        "pop": safe_float(
+            value.get("pop")
+        ),
+
+        "volume": safe_float(
+            value.get("volume"),
+            0
+        ),
+
+        "oi": safe_float(
+            value.get("oi")
+        ),
+    }
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_intraday(key, minutes=5):
-    enc = requests.utils.quote(key, safe="")
-    raw = api_get(f"/v3/historical-candle/intraday/{enc}/minutes/{minutes}")
-    return parse_candles(raw)
+# ================================================================
+# BUILD OPTION DATAFRAME
+# ================================================================
+
+def build_option_dataframe(
+    resolved
+):
+
+    contracts = resolved.get(
+        "contracts",
+        []
+    )
+
+    keys = [
+        str(
+            row.get("instrument_key")
+        )
+        for row in contracts
+        if row.get("instrument_key")
+    ]
+
+    quotes = get_quotes(keys)
+
+    greeks = get_option_greeks(keys)
+
+    rows = []
+
+    for contract in contracts:
+
+        key = str(
+            contract.get(
+                "instrument_key",
+                ""
+            )
+        )
+
+        quote = parse_quote(
+            quotes.get(
+                key,
+                {}
+            )
+        )
+
+        greek = parse_greek(
+            greeks.get(
+                key,
+                {}
+            )
+        )
+
+        oi = quote["oi"]
+
+        if not np.isfinite(oi):
+            oi = greek["oi"]
+
+        volume = quote["volume"]
+
+        if not np.isfinite(volume):
+            volume = greek["volume"]
+
+        lot_size = safe_float(
+            contract.get(
+                "lot_size",
+                contract.get(
+                    "minimum_lot",
+                    1
+                )
+            ),
+            1
+        )
+
+        rows.append({
+            "instrument_key": key,
+
+            "trading_symbol":
+                contract.get(
+                    "trading_symbol",
+                    ""
+                ),
+
+            "option_type":
+                str(
+                    contract.get(
+                        "instrument_type",
+                        ""
+                    )
+                ).upper(),
+
+            "strike":
+                safe_float(
+                    contract.get(
+                        "strike_price"
+                    )
+                ),
+
+            "expiry":
+                expiry_string(
+                    contract.get(
+                        "expiry"
+                    )
+                ),
+
+            "lot_size": lot_size,
+
+            "tick_size":
+                safe_float(
+                    contract.get(
+                        "tick_size"
+                    )
+                ),
+
+            "underlying_key":
+                str(
+                    contract.get(
+                        "underlying_key",
+                        ""
+                    )
+                ).strip(),
+
+            "ltp":
+                quote["ltp"],
+
+            "open":
+                quote["open"],
+
+            "high":
+                quote["high"],
+
+            "low":
+                quote["low"],
+
+            "close":
+                quote["close"],
+
+            "volume":
+                volume,
+
+            "oi":
+                oi,
+
+            "previous_oi":
+                quote["previous_oi"],
+
+            "bid":
+                quote["bid"],
+
+            "ask":
+                quote["ask"],
+
+            "delta":
+                greek["delta"],
+
+            "gamma":
+                greek["gamma"],
+
+            "theta":
+                greek["theta"],
+
+            "vega":
+                greek["vega"],
+
+            "iv":
+                greek["iv"],
+
+            "pop":
+                greek["pop"],
+        })
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        raise RuntimeError(
+            "Upstox returned no usable MCX option contracts."
+        )
+
+    return (
+        df
+        .sort_values(
+            ["strike", "option_type"]
+        )
+        .reset_index(drop=True)
+    )
 
 
-def parse_candles(raw):
-    rows = raw.get("data", {}).get("candles", [])
-    out=[]
-    for c in rows:
-        if len(c)>=6:
-            out.append({"timestamp":pd.to_datetime(c[0], errors="coerce"),"open":sf(c[1]),"high":sf(c[2]),"low":sf(c[3]),"close":sf(c[4]),"volume":sf(c[5],0),"oi":sf(c[6]) if len(c)>6 else np.nan})
-    df=pd.DataFrame(out)
-    return df.dropna(subset=["timestamp","close"]).sort_values("timestamp").reset_index(drop=True) if not df.empty else df
+# ================================================================
+# CANDLE DATA
+# ================================================================
 
+def parse_candles(payload):
+
+    data = payload.get(
+        "data",
+        {}
+    ) or {}
+
+    candles = data.get(
+        "candles",
+        []
+    ) or []
+
+    rows = []
+
+    for candle in candles:
+
+        if len(candle) < 6:
+            continue
+
+        timestamp = pd.to_datetime(
+            candle[0],
+            errors="coerce"
+        )
+
+        rows.append({
+            "timestamp": timestamp,
+
+            "open":
+                safe_float(candle[1]),
+
+            "high":
+                safe_float(candle[2]),
+
+            "low":
+                safe_float(candle[3]),
+
+            "close":
+                safe_float(candle[4]),
+
+            "volume":
+                safe_float(
+                    candle[5],
+                    0
+                ),
+
+            "oi":
+                safe_float(
+                    candle[6]
+                )
+                if len(candle) > 6
+                else np.nan,
+        })
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        return df
+
+    return (
+        df
+        .dropna(
+            subset=[
+                "timestamp",
+                "close"
+            ]
+        )
+        .sort_values(
+            "timestamp"
+        )
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(
+    ttl=60,
+    show_spinner=False
+)
+def get_intraday(
+    instrument_key,
+    interval
+):
+
+    encoded = requests.utils.quote(
+        str(instrument_key),
+        safe=""
+    )
+
+    payload = api_get(
+        f"/v3/historical-candle/"
+        f"intraday/"
+        f"{encoded}/"
+        f"minutes/"
+        f"{interval}",
+        timeout=30,
+    )
+
+    return parse_candles(
+        payload
+    )
+
+
+@st.cache_data(
+    ttl=600,
+    show_spinner=False
+)
+def get_daily(
+    instrument_key
+):
+
+    end_date = date.today()
+
+    start_date = (
+        end_date
+        - timedelta(days=370)
+    )
+
+    encoded = requests.utils.quote(
+        str(instrument_key),
+        safe=""
+    )
+
+    payload = api_get(
+        f"/v3/historical-candle/"
+        f"{encoded}/"
+        f"days/1/"
+        f"{end_date.isoformat()}/"
+        f"{start_date.isoformat()}",
+        timeout=30,
+    )
+
+    return parse_candles(
+        payload
+    )
+
+
+# ================================================================
+# TECHNICAL INDICATORS
+# ================================================================
 
 def add_indicators(df):
-    x=df.copy()
-    d=x.close.diff(); gain=d.clip(lower=0); loss=-d.clip(upper=0)
-    ag=gain.ewm(alpha=1/14, adjust=False, min_periods=14).mean(); al=loss.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
-    rs=ag/al.replace(0,np.nan); x["rsi"]=100-100/(1+rs)
-    x["ema20"]=x.close.ewm(span=20,adjust=False).mean(); x["ema50"]=x.close.ewm(span=50,adjust=False).mean()
-    pc=x.close.shift(1); tr=pd.concat([x.high-x.low,(x.high-pc).abs(),(x.low-pc).abs()],axis=1).max(axis=1)
-    x["atr14"]=tr.ewm(alpha=1/14,adjust=False).mean()
-    typ=(x.high+x.low+x.close)/3; v=x.volume.fillna(0); cv=v.cumsum().replace(0,np.nan); x["vwap"]=(typ*v).cumsum()/cv
-    up=x.high.diff(); dn=-x.low.diff(); plus=np.where((up>dn)&(up>0),up,0); minus=np.where((dn>up)&(dn>0),dn,0)
-    atr=x["atr14"]; pdi=100*pd.Series(plus,index=x.index).ewm(alpha=1/14,adjust=False).mean()/atr.replace(0,np.nan); mdi=100*pd.Series(minus,index=x.index).ewm(alpha=1/14,adjust=False).mean()/atr.replace(0,np.nan)
-    dx=100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan); x["adx"]=dx.ewm(alpha=1/14,adjust=False).mean()
-    x["vol_ma20"]=x.volume.rolling(20).mean()
+
+    x = df.copy()
+
+    if x.empty:
+        return x
+
+    close = x["close"]
+
+    delta = close.diff()
+
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
+
+    avg_gain = gain.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14
+    ).mean()
+
+    rs = (
+        avg_gain
+        /
+        avg_loss.replace(
+            0,
+            np.nan
+        )
+    )
+
+    x["rsi"] = (
+        100
+        -
+        100 / (1 + rs)
+    )
+
+    x["ema20"] = (
+        close
+        .ewm(
+            span=20,
+            adjust=False
+        )
+        .mean()
+    )
+
+    x["ema50"] = (
+        close
+        .ewm(
+            span=50,
+            adjust=False
+        )
+        .mean()
+    )
+
+    previous_close = close.shift(1)
+
+    tr = pd.concat(
+        [
+            x["high"] - x["low"],
+
+            (
+                x["high"]
+                - previous_close
+            ).abs(),
+
+            (
+                x["low"]
+                - previous_close
+            ).abs(),
+        ],
+        axis=1
+    ).max(axis=1)
+
+    x["atr14"] = tr.ewm(
+        alpha=1 / 14,
+        adjust=False
+    ).mean()
+
+    typical_price = (
+        x["high"]
+        + x["low"]
+        + x["close"]
+    ) / 3
+
+    volume = (
+        x["volume"]
+        .fillna(0)
+    )
+
+    cumulative_volume = (
+        volume
+        .cumsum()
+        .replace(
+            0,
+            np.nan
+        )
+    )
+
+    x["vwap"] = (
+        typical_price
+        * volume
+    ).cumsum() / cumulative_volume
+
+    # ADX
+
+    up_move = x["high"].diff()
+
+    down_move = -x["low"].diff()
+
+    plus_dm = np.where(
+        (
+            (up_move > down_move)
+            &
+            (up_move > 0)
+        ),
+        up_move,
+        0
+    )
+
+    minus_dm = np.where(
+        (
+            (down_move > up_move)
+            &
+            (down_move > 0)
+        ),
+        down_move,
+        0
+    )
+
+    atr = x["atr14"].replace(
+        0,
+        np.nan
+    )
+
+    plus_di = (
+        100
+        *
+        pd.Series(
+            plus_dm,
+            index=x.index
+        )
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
+        /
+        atr
+    )
+
+    minus_di = (
+        100
+        *
+        pd.Series(
+            minus_dm,
+            index=x.index
+        )
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
+        /
+        atr
+    )
+
+    dx = (
+        100
+        *
+        (
+            plus_di
+            - minus_di
+        ).abs()
+        /
+        (
+            plus_di
+            + minus_di
+        ).replace(
+            0,
+            np.nan
+        )
+    )
+
+    x["adx"] = dx.ewm(
+        alpha=1 / 14,
+        adjust=False
+    ).mean()
+
+    x["volume_ma20"] = (
+        x["volume"]
+        .rolling(20)
+        .mean()
+    )
+
     return x
 
 
-def resample(df, rule):
-    if df.empty:return df
-    x=df.set_index("timestamp").resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum","oi":"last"}).dropna(subset=["close"]).reset_index()
-    return x
+def timeframe_analysis(df):
+
+    if df.empty or len(df) < 25:
+
+        return {
+            "trend": "UNKNOWN",
+            "score": 0,
+            "rsi": np.nan,
+            "adx": np.nan,
+            "atr": np.nan,
+            "ema20": np.nan,
+            "ema50": np.nan,
+            "vwap": np.nan,
+            "close": np.nan,
+            "volume_confirmed": False,
+        }
+
+    x = add_indicators(df)
+
+    row = x.iloc[-1]
+
+    close = safe_float(
+        row["close"]
+    )
+
+    ema20 = safe_float(
+        row["ema20"]
+    )
+
+    ema50 = safe_float(
+        row["ema50"]
+    )
+
+    rsi = safe_float(
+        row["rsi"]
+    )
+
+    adx = safe_float(
+        row["adx"]
+    )
+
+    vwap = safe_float(
+        row["vwap"]
+    )
+
+    volume = safe_float(
+        row["volume"],
+        0
+    )
+
+    volume_ma = safe_float(
+        row["volume_ma20"],
+        0
+    )
+
+    bullish = (
+        np.isfinite(close)
+        and np.isfinite(ema20)
+        and np.isfinite(ema50)
+        and np.isfinite(rsi)
+        and close > ema20
+        and ema20 >= ema50
+        and rsi >= 52
+    )
+
+    bearish = (
+        np.isfinite(close)
+        and np.isfinite(ema20)
+        and np.isfinite(ema50)
+        and np.isfinite(rsi)
+        and close < ema20
+        and ema20 <= ema50
+        and rsi <= 48
+    )
+
+    if bullish:
+        trend = "BULLISH"
+    elif bearish:
+        trend = "BEARISH"
+    else:
+        trend = "NEUTRAL"
+
+    score = 0
+
+    if (
+        np.isfinite(close)
+        and np.isfinite(ema20)
+    ):
+        if close > ema20:
+            score += 20
+
+    if (
+        np.isfinite(ema20)
+        and np.isfinite(ema50)
+    ):
+        if ema20 > ema50:
+            score += 20
+
+    if np.isfinite(rsi):
+
+        if rsi >= 52:
+            score += 15
+
+        elif rsi <= 48:
+            score += 15
+
+    if np.isfinite(adx):
+        if adx >= 20:
+            score += 15
+
+    if (
+        np.isfinite(close)
+        and np.isfinite(vwap)
+    ):
+        if close >= vwap:
+            score += 10
+
+    volume_confirmed = (
+        volume_ma > 0
+        and volume >= volume_ma
+    )
+
+    if volume_confirmed:
+        score += 5
+
+    return {
+        "trend": trend,
+        "score": min(
+            int(score),
+            100
+        ),
+        "rsi": rsi,
+        "adx": adx,
+        "atr": safe_float(
+            row["atr14"]
+        ),
+        "ema20": ema20,
+        "ema50": ema50,
+        "vwap": vwap,
+        "close": close,
+        "volume_confirmed":
+            volume_confirmed,
+    }
 
 
-def tf_analysis(df):
-    if df.empty or len(df)<30:return {"trend":"UNKNOWN","score":0,"rsi":np.nan,"adx":np.nan,"atr":np.nan,"ema20":np.nan,"ema50":np.nan,"vwap":np.nan,"volume_confirmed":False,"close":np.nan}
-    x=add_indicators(df); z=x.iloc[-1]
-    bull=z.close>z.ema20 and z.ema20>=z.ema50 and z.rsi>=52
-    bear=z.close<z.ema20 and z.ema20<=z.ema50 and z.rsi<=48
-    trend="BULLISH" if bull else "BEARISH" if bear else "NEUTRAL"
-    score=0
-    score+=20 if z.close>z.ema20 else 0; score+=20 if z.ema20>z.ema50 else 0
-    score+=15 if z.rsi>=52 else 15 if z.rsi<=48 else 0; score+=15 if z.adx>=20 else 0
-    score+=10 if z.close>=z.vwap else 0; score+=5 if sf(z.vol_ma20,0)>0 and z.volume>=z.vol_ma20 else 0
-    return {"trend":trend,"score":min(100,int(score)),"rsi":sf(z.rsi),"adx":sf(z.adx),"atr":sf(z.atr14),"ema20":sf(z.ema20),"ema50":sf(z.ema50),"vwap":sf(z.vwap),"volume_confirmed":sf(z.vol_ma20,0)>0 and z.volume>=z.vol_ma20,"close":sf(z.close)}
+# ================================================================
+# OPTION STRUCTURE
+# ================================================================
+
+def calculate_option_structure(
+    option_df,
+    underlying_price
+):
+
+    result = {
+        "atm": np.nan,
+        "pcr": np.nan,
+        "support": np.nan,
+        "resistance": np.nan,
+        "put_wall": np.nan,
+        "call_wall": np.nan,
+    }
+
+    if option_df.empty:
+        return result
+
+    strikes = (
+        pd.to_numeric(
+            option_df["strike"],
+            errors="coerce"
+        )
+        .dropna()
+        .unique()
+    )
+
+    if len(strikes) == 0:
+        return result
+
+    if np.isfinite(
+        underlying_price
+    ):
+
+        atm = min(
+            strikes,
+            key=lambda x:
+                abs(
+                    x
+                    - underlying_price
+                )
+        )
+
+    else:
+
+        atm = float(
+            np.median(
+                strikes
+            )
+        )
+
+    result["atm"] = float(atm)
+
+    calls = option_df[
+        option_df["option_type"] == "CE"
+    ].copy()
+
+    puts = option_df[
+        option_df["option_type"] == "PE"
+    ].copy()
+
+    call_oi = (
+        calls["oi"]
+        .fillna(0)
+        .clip(lower=0)
+    )
+
+    put_oi = (
+        puts["oi"]
+        .fillna(0)
+        .clip(lower=0)
+    )
+
+    total_call_oi = float(
+        call_oi.sum()
+    )
+
+    total_put_oi = float(
+        put_oi.sum()
+    )
+
+    if total_call_oi > 0:
+
+        result["pcr"] = (
+            total_put_oi
+            /
+            total_call_oi
+        )
+
+    if (
+        not calls.empty
+        and call_oi.max() > 0
+    ):
+
+        idx = call_oi.idxmax()
+
+        result["call_wall"] = safe_float(
+            calls.loc[
+                idx,
+                "strike"
+            ]
+        )
+
+    if (
+        not puts.empty
+        and put_oi.max() > 0
+    ):
+
+        idx = put_oi.idxmax()
+
+        result["put_wall"] = safe_float(
+            puts.loc[
+                idx,
+                "strike"
+            ]
+        )
+
+    put_candidates = puts[
+        puts["strike"] <= atm
+    ].copy()
+
+    call_candidates = calls[
+        calls["strike"] >= atm
+    ].copy()
+
+    if not put_candidates.empty:
+
+        put_candidates = (
+            put_candidates
+            .sort_values(
+                ["oi", "strike"],
+                ascending=[
+                    False,
+                    False
+                ]
+            )
+        )
+
+        result["support"] = safe_float(
+            put_candidates.iloc[
+                0
+            ]["strike"]
+        )
+
+    if not call_candidates.empty:
+
+        call_candidates = (
+            call_candidates
+            .sort_values(
+                ["oi", "strike"],
+                ascending=[
+                    False,
+                    True
+                ]
+            )
+        )
+
+        result["resistance"] = safe_float(
+            call_candidates.iloc[
+                0
+            ]["strike"]
+        )
+
+    return result
 
 
-def levels(df):
-    if df.empty:return np.nan,np.nan
-    r=df.tail(min(80,len(df))); return sf(r.low.min()),sf(r.high.max())
+# ================================================================
+# SELECT NEAREST OPTION
+# ================================================================
+
+def choose_option(
+    option_df,
+    option_type,
+    underlying_price
+):
+
+    side = option_df[
+        option_df["option_type"]
+        == option_type
+    ].copy()
+
+    if side.empty:
+        return {}
+
+    if np.isfinite(
+        underlying_price
+    ):
+
+        side["distance"] = (
+            side["strike"]
+            - underlying_price
+        ).abs()
+
+    else:
+
+        side["distance"] = 0
+
+    side["liquidity"] = (
+        side["volume"]
+        .fillna(0)
+        .clip(lower=0)
+        +
+        side["oi"]
+        .fillna(0)
+        .clip(lower=0)
+        * 0.10
+    )
+
+    side = side.sort_values(
+        [
+            "distance",
+            "liquidity"
+        ],
+        ascending=[
+            True,
+            False
+        ]
+    )
+
+    return side.iloc[0].to_dict()
 
 
-def build_plan(q,a5,a30,ad,lot,risk):
-    p=q["ltp"]; atr=a5["atr"]
-    if not np.isfinite(p): return {"decision":"NO TRADE","reason":"Live price unavailable."}
-    if not np.isfinite(atr) or atr<=0: atr=max(p*0.005,0.01)
-    mult={"Conservative":(.75,1.25,1.75),"Balanced":(.65,1.35,1.90),"Aggressive":(.55,1.50,2.20)}[risk]
-    quality=int(.45*a5["score"]+.35*a30["score"]+.20*ad["score"])
-    bull=a5["trend"]==a30["trend"]=="BULLISH"; bear=a5["trend"]==a30["trend"]=="BEARISH"
-    if bull: decision="BUY"; entry=p; sl=p-atr*mult[0]; t1=p+atr*mult[1]; t2=p+atr*mult[2]
-    elif bear: decision="SELL"; entry=p; sl=p+atr*mult[0]; t1=p-atr*mult[1]; t2=p-atr*mult[2]
-    else: decision="NO TRADE"; entry=sl=t1=t2=np.nan
-    if decision=="NO TRADE":
-        why=[]
-        if not (bull or bear):why.append("5-minute and 30-minute trends are not aligned.")
-        if quality<55:why.append(f"Quality score is only {quality}/100.")
-        return {"decision":decision,"quality":quality,"entry":entry,"sl":sl,"t1":t1,"t2":t2,"lot":lot,"reason":" ".join(why) or "Setup did not pass the trade-quality gate."}
-    risk_u=abs(entry-sl); r1=abs(t1-entry)/risk_u if risk_u else np.nan; r2=abs(t2-entry)/risk_u if risk_u else np.nan
-    pop=float(np.clip(50+(quality-50)*.55+(3 if a5["volume_confirmed"] else 0)+(3 if ad["trend"]==a30["trend"] and ad["trend"] in ("BULLISH","BEARISH") else 0),50,82))
-    return {"decision":decision,"quality":quality,"entry":entry,"sl":sl,"t1":t1,"t2":t2,"lot":lot,"rr1":r1,"rr2":r2,"max_loss":risk_u*lot,"t1_pnl":abs(t1-entry)*lot,"t2_pnl":abs(t2-entry)*lot,"pop":pop,"reason":"Trend, momentum and timeframe alignment support the setup."}
+# ================================================================
+# TRADE PLAN
+# ================================================================
+
+def build_trade_plan(
+    selected_option,
+    direction,
+    analysis_5m,
+    analysis_30m,
+    analysis_daily,
+    risk_profile
+):
+
+    if not selected_option:
+
+        return {
+            "decision": "NO TRADE",
+            "quality": 0,
+            "reason":
+                "No suitable option contract found.",
+        }
+
+    premium = safe_float(
+        selected_option.get(
+            "ltp"
+        )
+    )
+
+    if (
+        not np.isfinite(premium)
+        or premium <= 0
+    ):
+
+        return {
+            "decision": "NO TRADE",
+            "quality": 0,
+            "reason":
+                "Selected option has no usable live premium.",
+        }
+
+    quality = int(
+        0.45
+        * analysis_5m.get(
+            "score",
+            0
+        )
+        +
+        0.35
+        * analysis_30m.get(
+            "score",
+            0
+        )
+        +
+        0.20
+        * analysis_daily.get(
+            "score",
+            0
+        )
+    )
+
+    bullish_alignment = (
+        analysis_5m["trend"]
+        == "BULLISH"
+        and
+        analysis_30m["trend"]
+        == "BULLISH"
+    )
+
+    bearish_alignment = (
+        analysis_5m["trend"]
+        == "BEARISH"
+        and
+        analysis_30m["trend"]
+        == "BEARISH"
+    )
+
+    if (
+        direction == "CALL BUY"
+        and not bullish_alignment
+    ):
+
+        return {
+            "decision": "NO TRADE",
+            "quality": quality,
+            "reason":
+                "CALL BUY rejected because "
+                "the 5-minute and 30-minute "
+                "underlying trends are not "
+                "both bullish.",
+        }
+
+    if (
+        direction == "PUT BUY"
+        and not bearish_alignment
+    ):
+
+        return {
+            "decision": "NO TRADE",
+            "quality": quality,
+            "reason":
+                "PUT BUY rejected because "
+                "the 5-minute and 30-minute "
+                "underlying trends are not "
+                "both bearish.",
+        }
+
+    if quality < 55:
+
+        return {
+            "decision": "NO TRADE",
+            "quality": quality,
+            "reason":
+                f"Setup quality is "
+                f"{quality}/100, below "
+                f"the minimum quality gate.",
+        }
+
+    profiles = {
+
+        "Conservative": (
+            0.65,
+            1.20,
+            1.60
+        ),
+
+        "Balanced": (
+            0.55,
+            1.35,
+            1.90
+        ),
+
+        "Aggressive": (
+            0.45,
+            1.50,
+            2.20
+        ),
+    }
+
+    sl_percent, t1_percent, t2_percent = (
+        profiles[
+            risk_profile
+        ]
+    )
+
+    entry = premium
+
+    stop_loss = max(
+        entry
+        * (
+            1
+            - sl_percent
+        ),
+        0.01
+    )
+
+    target_1 = (
+        entry
+        * (
+            1
+            + t1_percent
+        )
+    )
+
+    target_2 = (
+        entry
+        * (
+            1
+            + t2_percent
+        )
+    )
+
+    lot_size = safe_float(
+        selected_option.get(
+            "lot_size",
+            1
+        ),
+        1
+    )
+
+    risk_per_unit = (
+        entry
+        - stop_loss
+    )
+
+    profit_t1_per_unit = (
+        target_1
+        - entry
+    )
+
+    profit_t2_per_unit = (
+        target_2
+        - entry
+    )
+
+    max_loss = (
+        risk_per_unit
+        * lot_size
+    )
+
+    t1_profit = (
+        profit_t1_per_unit
+        * lot_size
+    )
+
+    t2_profit = (
+        profit_t2_per_unit
+        * lot_size
+    )
+
+    rr1 = (
+        profit_t1_per_unit
+        /
+        risk_per_unit
+        if risk_per_unit > 0
+        else np.nan
+    )
+
+    rr2 = (
+        profit_t2_per_unit
+        /
+        risk_per_unit
+        if risk_per_unit > 0
+        else np.nan
+    )
+
+    option_pop = safe_float(
+        selected_option.get(
+            "pop"
+        )
+    )
+
+    if np.isfinite(
+        option_pop
+    ):
+
+        pop = option_pop
+        pop_source = (
+            "Upstox Option Greek API"
+        )
+
+    else:
+
+        pop = float(
+            np.clip(
+                50
+                +
+                (
+                    quality
+                    - 50
+                )
+                * 0.50
+                +
+                (
+                    4
+                    if analysis_5m[
+                        "volume_confirmed"
+                    ]
+                    else 0
+                ),
+                50,
+                82
+            )
+        )
+
+        pop_source = (
+            "Rule-based estimate"
+        )
+
+    return {
+        "decision": direction,
+        "quality": quality,
+        "entry": entry,
+        "sl": stop_loss,
+        "t1": target_1,
+        "t2": target_2,
+        "lot": lot_size,
+        "risk_per_unit": risk_per_unit,
+        "t1_profit_per_unit":
+            profit_t1_per_unit,
+        "t2_profit_per_unit":
+            profit_t2_per_unit,
+        "max_loss": max_loss,
+        "t1_pnl": t1_profit,
+        "t2_pnl": t2_profit,
+        "rr1": rr1,
+        "rr2": rr2,
+        "pop": pop,
+        "pop_source": pop_source,
+        "reason":
+            f"Underlying technical alignment "
+            f"supports {direction}. "
+            f"The selected option is the "
+            f"nearest usable CE/PE contract "
+            f"to the underlying price.",
+    }
 
 
-def safety(plan,a5,a30,ad):
-    checks=[]; aligned=a5["trend"]==a30["trend"] and a5["trend"] in ("BULLISH","BEARISH")
-    checks.append(("PASS" if plan["decision"] in ("BUY","SELL") else "STOP","Trade direction","A clear trade direction exists." if plan["decision"] in ("BUY","SELL") else "No clear trade direction."))
-    checks.append(("PASS" if aligned else "STOP","Timeframe agreement","5-minute and 30-minute trends agree." if aligned else "5-minute and 30-minute trends do not agree."))
-    checks.append(("PASS" if a5["volume_confirmed"] else "WAIT","Volume confirmation","Recent volume confirms activity." if a5["volume_confirmed"] else "Volume has not confirmed the move."))
-    rr=sf(plan.get("rr1")); checks.append(("PASS" if np.isfinite(rr) and rr>=1 else "STOP","Risk / Reward",f"Target 1 is about {rr:.1f}R." if np.isfinite(rr) else "Risk/reward unavailable."))
-    q=sf(plan.get("quality"),0); checks.append(("PASS" if q>=60 else "STOP","Setup quality",f"Quality score is {q:.0f}/100."))
-    return {"safe":all(x[0]!="STOP" for x in checks),"checks":checks}
+# ================================================================
+# SAFETY CHECKS
+# ================================================================
+
+def beginner_safety_checks(
+    plan,
+    analysis_5m,
+    analysis_30m
+):
+
+    checks = []
+
+    decision = plan.get(
+        "decision",
+        "NO TRADE"
+    )
+
+    checks.append(
+        (
+            "PASS"
+            if decision
+            in {
+                "CALL BUY",
+                "PUT BUY"
+            }
+            else "STOP",
+
+            "Trade Direction",
+
+            (
+                "A defined option "
+                "buying direction exists."
+                if decision
+                in {
+                    "CALL BUY",
+                    "PUT BUY"
+                }
+                else
+                "No valid option-buying "
+                "direction exists."
+            )
+        )
+    )
+
+    alignment = (
+        analysis_5m["trend"]
+        ==
+        analysis_30m["trend"]
+        and
+        analysis_5m["trend"]
+        in {
+            "BULLISH",
+            "BEARISH"
+        }
+    )
+
+    checks.append(
+        (
+            "PASS"
+            if alignment
+            else "STOP",
+
+            "Timeframe Agreement",
+
+            (
+                "5-minute and 30-minute "
+                "underlying trends agree."
+                if alignment
+                else
+                "5-minute and 30-minute "
+                "underlying trends do not agree."
+            )
+        )
+    )
+
+    volume_ok = (
+        analysis_5m[
+            "volume_confirmed"
+        ]
+    )
+
+    checks.append(
+        (
+            "PASS"
+            if volume_ok
+            else "WAIT",
+
+            "Underlying Volume",
+
+            (
+                "Recent underlying "
+                "volume confirms activity."
+                if volume_ok
+                else
+                "Underlying volume has "
+                "not confirmed the move."
+            )
+        )
+    )
+
+    rr = safe_float(
+        plan.get("rr1")
+    )
+
+    checks.append(
+        (
+            "PASS"
+            if (
+                np.isfinite(rr)
+                and rr >= 1
+            )
+            else "STOP",
+
+            "Risk / Reward",
+
+            (
+                f"Target 1 is approximately "
+                f"{rr:.1f}R."
+                if np.isfinite(rr)
+                else
+                "Risk/reward unavailable."
+            )
+        )
+    )
+
+    quality = safe_float(
+        plan.get(
+            "quality",
+            0
+        ),
+        0
+    )
+
+    checks.append(
+        (
+            "PASS"
+            if quality >= 60
+            else "STOP",
+
+            "Setup Quality",
+
+            f"Quality score is "
+            f"{quality:.0f}/100."
+        )
+    )
+
+    safe = all(
+        status != "STOP"
+        for status, _, _
+        in checks
+    )
+
+    return {
+        "safe": safe,
+        "checks": checks,
+    }
 
 
-def css():
-    st.markdown("""<style>
-    .title{font-size:34px;font-weight:800}.sub{color:#6b7280;margin-bottom:18px}
-    .box{border:1px solid rgba(128,128,128,.22);border-radius:12px;padding:14px}
-    </style>""",unsafe_allow_html=True)
+# ================================================================
+# SAFE TECHNICAL DATA LOADER
+# ================================================================
 
-css()
-st.markdown('<div class="title">🛢️ Commodity PRO Trader Assistant</div>',unsafe_allow_html=True)
-st.markdown('<div class="sub">Standalone MCX futures analysis • live Upstox data • technicals • risk plan • beginner safety</div>',unsafe_allow_html=True)
+def load_underlying_analysis(
+    underlying_key
+):
+
+    errors = []
+
+    # -------------------------
+    # 5 minute
+    # -------------------------
+
+    try:
+
+        candles_5m = get_intraday(
+            underlying_key,
+            5
+        )
+
+    except Exception as exc:
+
+        candles_5m = pd.DataFrame()
+
+        errors.append(
+            f"5-minute data: {exc}"
+        )
+
+    # -------------------------
+    # 30 minute
+    # -------------------------
+
+    try:
+
+        candles_30m = get_intraday(
+            underlying_key,
+            30
+        )
+
+    except Exception as exc:
+
+        candles_30m = pd.DataFrame()
+
+        errors.append(
+            f"30-minute data: {exc}"
+        )
+
+    # -------------------------
+    # Daily
+    # -------------------------
+
+    try:
+
+        candles_daily = get_daily(
+            underlying_key
+        )
+
+    except Exception as exc:
+
+        candles_daily = pd.DataFrame()
+
+        errors.append(
+            f"Daily data: {exc}"
+        )
+
+    analysis_5m = timeframe_analysis(
+        candles_5m
+    )
+
+    analysis_30m = timeframe_analysis(
+        candles_30m
+    )
+
+    analysis_daily = timeframe_analysis(
+        candles_daily
+    )
+
+    return (
+        analysis_5m,
+        analysis_30m,
+        analysis_daily,
+        errors,
+    )
+
+
+# ================================================================
+# PAGE STYLE
+# ================================================================
+
+st.markdown(
+    """
+    <style>
+
+    .main-title {
+        font-size: 34px;
+        font-weight: 800;
+        line-height: 1.15;
+        margin-bottom: 4px;
+    }
+
+    .subtitle {
+        color: #6b7280;
+        font-size: 15px;
+        margin-bottom: 18px;
+    }
+
+    div[data-testid="stMetricValue"] {
+        font-size: 1.35rem;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ================================================================
+# HEADER
+# ================================================================
+
+st.markdown(
+    '<div class="main-title">'
+    '🛢️ Commodity PRO Trader Assistant'
+    '</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="subtitle">'
+    'MCX commodity OPTIONS only • '
+    'live Upstox data • CE/PE • '
+    'Greeks • OI • technicals • '
+    'risk plan'
+    '</div>',
+    unsafe_allow_html=True
+)
+
+st.info(
+    "OPTION-ONLY MODE: This application does NOT "
+    "search for, resolve, or analyze MCX futures "
+    "for trading. It finds MCX CE/PE contracts "
+    "directly and uses the option contract's "
+    "underlying_key only as the reference market."
+)
+
+
+# ================================================================
+# SIDEBAR
+# ================================================================
 
 with st.sidebar:
-    st.header("⚙️ Analysis Settings")
-    q=st.text_input("Commodity", "Crude Oil", placeholder="Crude Oil / Gold / Silver / Copper")
-    risk=st.selectbox("Risk Profile", ["Conservative","Balanced","Aggressive"], index=1)
-    beginner=st.checkbox("Beginner Safety + Explainability", True)
-    analyze=st.button("🔎 Analyze Live Commodity", type="primary", use_container_width=True)
+
+    st.header(
+        "⚙️ Analysis Settings"
+    )
+
+    commodity = st.text_input(
+        "Commodity",
+        value="Crude Oil",
+        placeholder=(
+            "Gold / Crude Oil / "
+            "Silver / Natural Gas"
+        )
+    )
+
+    risk_profile = st.selectbox(
+        "Risk Profile",
+        [
+            "Conservative",
+            "Balanced",
+            "Aggressive"
+        ],
+        index=1
+    )
+
+    beginner_mode = st.checkbox(
+        "Beginner Safety + Explainability",
+        value=True
+    )
+
+    analyze_button = st.button(
+        "🔎 Analyze Commodity Options",
+        type="primary",
+        use_container_width=True
+    )
+
     st.markdown("---")
-    st.caption("Examples: Crude Oil • Natural Gas • Gold • Silver • Copper • Zinc • Aluminium • Lead • Nickel")
-    st.caption("Decision-support only. Model PoP is an estimate, not a guarantee.")
 
-if "result" not in st.session_state: st.session_state.result=None
-if analyze:
-    with st.spinner("Resolving MCX futures contract and analyzing live market..."):
+    st.caption(
+        "Examples:"
+    )
+
+    st.caption(
+        "Gold • Gold Mini • Silver • "
+        "Silver Mini • Crude Oil • "
+        "Crude Oil Mini • Natural Gas • "
+        "Copper • Zinc • Aluminium • "
+        "Lead • Nickel"
+    )
+
+    st.caption(
+        "Decision: CALL BUY / PUT BUY / NO TRADE"
+    )
+
+    st.caption(
+        "PoP is informational and is not a "
+        "guarantee of profit."
+    )
+
+
+# ================================================================
+# SESSION
+# ================================================================
+
+if "commodity_result" not in st.session_state:
+
+    st.session_state[
+        "commodity_result"
+    ] = None
+
+
+# ================================================================
+# ANALYZE
+# ================================================================
+
+if analyze_button:
+
+    with st.spinner(
+        "Finding MCX CE/PE options and "
+        "analyzing live data..."
+    ):
+
         try:
-            contract,candidates=resolve_future(q)
-            if not contract: raise RuntimeError(f"Could not resolve an active MCX futures contract for '{q}'.")
-            key=contract.get("instrument_key")
-            qq=extract_quote(quote(key),key)
-            d1=get_intraday(key,1)
-            d5=get_intraday(key,5)
-            # V3 historical daily data supplies a real daily timeframe; intraday is used for 5m.
-            day=candles(key,"days",1,370)
-            if d5.empty: d5=d1
-            d30=resample(d1 if not d1.empty else d5,"30min")
-            if d30.empty or len(d30)<30: d30=resample(d5,"30min")
-            a5=tf_analysis(d5); a30=tf_analysis(d30); ad=tf_analysis(day)
-            sup,res=levels(d5)
-            lot=sf(contract.get("lot_size",contract.get("minimum_lot",1)),1)
-            plan=build_plan(qq,a5,a30,ad,lot,risk)
-            st.session_state.result={"contract":contract,"quote":qq,"a5":a5,"a30":a30,"ad":ad,"sup":sup,"res":res,"plan":plan,"safety":safety(plan,a5,a30,ad),"time":now_ist().strftime("%d %b %Y %I:%M:%S %p")}
-        except Exception as e:
-            st.session_state.result={"error":str(e)}
 
-r=st.session_state.result
-if not r:
-    st.info("Enter an MCX commodity in the sidebar and click Analyze Live Commodity.")
-elif r.get("error"):
-    st.error(r["error"])
+            # ----------------------------------------------------
+            # STEP 1:
+            # DIRECT MCX OPTION RESOLUTION
+            # ----------------------------------------------------
+
+            resolved = resolve_mcx_options(
+                commodity
+            )
+
+            # ----------------------------------------------------
+            # STEP 2:
+            # BUILD OPTION DATA
+            # ----------------------------------------------------
+
+            option_df = (
+                build_option_dataframe(
+                    resolved
+                )
+            )
+
+            # ----------------------------------------------------
+            # STEP 3:
+            # GET UNDERLYING KEY
+            #
+            # THIS COMES FROM THE OPTION.
+            # NO FUTURES LOOKUP.
+            # ----------------------------------------------------
+
+            underlying_key = str(
+                resolved.get(
+                    "underlying_key",
+                    ""
+                )
+            ).strip()
+
+            if not underlying_key:
+
+                for key in (
+                    option_df[
+                        "underlying_key"
+                    ]
+                    .dropna()
+                    .astype(str)
+                    .tolist()
+                ):
+
+                    if key.strip():
+
+                        underlying_key = (
+                            key.strip()
+                        )
+
+                        break
+
+            if not underlying_key:
+
+                raise RuntimeError(
+                    "MCX option contracts were "
+                    "found, but Upstox did not "
+                    "return their underlying_key. "
+                    "Please retry after refreshing "
+                    "the Upstox token."
+                )
+
+            # ----------------------------------------------------
+            # STEP 4:
+            # UNDERLYING LIVE QUOTE
+            # ----------------------------------------------------
+
+            underlying_quotes = get_quotes(
+                [underlying_key]
+            )
+
+            underlying_quote = parse_quote(
+                underlying_quotes.get(
+                    underlying_key,
+                    {}
+                )
+            )
+
+            underlying_price = safe_float(
+                underlying_quote.get(
+                    "ltp"
+                )
+            )
+
+            # ----------------------------------------------------
+            # STEP 5:
+            # TECHNICALS
+            #
+            # Technical failures do NOT stop
+            # option analysis.
+            # ----------------------------------------------------
+
+            (
+                analysis_5m,
+                analysis_30m,
+                analysis_daily,
+                technical_errors
+            ) = load_underlying_analysis(
+                underlying_key
+            )
+
+            # ----------------------------------------------------
+            # STEP 6:
+            # OPTION STRUCTURE
+            # ----------------------------------------------------
+
+            structure = (
+                calculate_option_structure(
+                    option_df,
+                    underlying_price
+                )
+            )
+
+            # ----------------------------------------------------
+            # STEP 7:
+            # SELECT CE / PE
+            # ----------------------------------------------------
+
+            call_option = choose_option(
+                option_df,
+                "CE",
+                underlying_price
+            )
+
+            put_option = choose_option(
+                option_df,
+                "PE",
+                underlying_price
+            )
+
+            # ----------------------------------------------------
+            # STEP 8:
+            # DECISION
+            # ----------------------------------------------------
+
+            if (
+                analysis_5m["trend"]
+                == "BULLISH"
+                and
+                analysis_30m["trend"]
+                == "BULLISH"
+            ):
+
+                direction = "CALL BUY"
+
+                selected_option = (
+                    call_option
+                )
+
+            elif (
+                analysis_5m["trend"]
+                == "BEARISH"
+                and
+                analysis_30m["trend"]
+                == "BEARISH"
+            ):
+
+                direction = "PUT BUY"
+
+                selected_option = (
+                    put_option
+                )
+
+            else:
+
+                direction = "NO TRADE"
+
+                selected_option = {}
+
+            # ----------------------------------------------------
+            # STEP 9:
+            # TRADE PLAN
+            # ----------------------------------------------------
+
+            if direction == "NO TRADE":
+
+                quality = int(
+                    0.45
+                    * analysis_5m[
+                        "score"
+                    ]
+                    +
+                    0.35
+                    * analysis_30m[
+                        "score"
+                    ]
+                    +
+                    0.20
+                    * analysis_daily[
+                        "score"
+                    ]
+                )
+
+                plan = {
+                    "decision":
+                        "NO TRADE",
+
+                    "quality":
+                        quality,
+
+                    "reason":
+                        "The 5-minute and "
+                        "30-minute underlying "
+                        "trends are not aligned "
+                        "strongly enough for an "
+                        "option-buying setup.",
+                }
+
+            else:
+
+                plan = build_trade_plan(
+                    selected_option,
+                    direction,
+                    analysis_5m,
+                    analysis_30m,
+                    analysis_daily,
+                    risk_profile
+                )
+
+            # ----------------------------------------------------
+            # STEP 10:
+            # SAFETY
+            # ----------------------------------------------------
+
+            safety = (
+                beginner_safety_checks(
+                    plan,
+                    analysis_5m,
+                    analysis_30m
+                )
+            )
+
+            # ----------------------------------------------------
+            # SAVE
+            # ----------------------------------------------------
+
+            st.session_state[
+                "commodity_result"
+            ] = {
+
+                "resolved":
+                    resolved,
+
+                "option_df":
+                    option_df,
+
+                "underlying_key":
+                    underlying_key,
+
+                "underlying_quote":
+                    underlying_quote,
+
+                "underlying_price":
+                    underlying_price,
+
+                "analysis_5m":
+                    analysis_5m,
+
+                "analysis_30m":
+                    analysis_30m,
+
+                "analysis_daily":
+                    analysis_daily,
+
+                "technical_errors":
+                    technical_errors,
+
+                "structure":
+                    structure,
+
+                "call_option":
+                    call_option,
+
+                "put_option":
+                    put_option,
+
+                "selected_option":
+                    selected_option,
+
+                "plan":
+                    plan,
+
+                "safety":
+                    safety,
+
+                "analysis_time":
+                    now_ist().strftime(
+                        "%d %b %Y %I:%M:%S %p"
+                    ),
+            }
+
+        except Exception as exc:
+
+            st.session_state[
+                "commodity_result"
+            ] = {
+                "error": str(exc)
+            }
+
+
+# ================================================================
+# DISPLAY
+# ================================================================
+
+result = st.session_state[
+    "commodity_result"
+]
+
+
+if not result:
+
+    st.info(
+        "Enter a commodity and click "
+        "'Analyze Commodity Options'."
+    )
+
+elif result.get("error"):
+
+    st.error(
+        result["error"]
+    )
+
 else:
-    c=r["contract"]; qq=r["quote"]; p=r["plan"]
-    st.markdown("## Selected Contract")
-    a,b,c1,d=st.columns(4)
-    a.metric("Commodity",c.get("name",c.get("trading_symbol","—")))
-    b.metric("Contract",c.get("trading_symbol","—"))
-    c1.metric("Expiry",str(c.get("expiry","—"))[:10])
-    d.metric("Lot Size",num(c.get("lot_size",1),0))
-    st.markdown("## Live Market")
-    a,b,c1,d=st.columns(4)
-    a.metric("LTP",money(qq.get("ltp"))); b.metric("Day High",money(qq.get("high"))); c1.metric("Day Low",money(qq.get("low"))); d.metric("OI",num(qq.get("oi"),0))
-    st.markdown("## Trade Plan")
-    if p["decision"]=="BUY": st.success("🟢 BUY SETUP")
-    elif p["decision"]=="SELL": st.warning("🔴 SELL SETUP")
-    else: st.info("⚪ NO TRADE")
-    a,b,c1,d=st.columns(4); a.metric("Entry",money(p.get("entry"))); b.metric("Stop Loss",money(p.get("sl"))); c1.metric("Target 1",money(p.get("t1"))); d.metric("Target 2",money(p.get("t2")))
-    if p["decision"] in ("BUY","SELL"):
-        a,b,c1,d=st.columns(4); a.metric("Max Loss / 1 Lot",money(p.get("max_loss"))); b.metric("T1 Potential / 1 Lot",money(p.get("t1_pnl"))); c1.metric("T2 Potential / 1 Lot",money(p.get("t2_pnl"))); d.metric("Model PoP",f'{p.get("pop",0):.1f}%')
-        a,b=st.columns(2); a.metric("Risk / Reward T1",f'{p.get("rr1",0):.2f}R'); b.metric("Risk / Reward T2",f'{p.get("rr2",0):.2f}R')
-        st.caption("Model PoP is a rule-based estimate and is not a guarantee of profit or a market-provided probability.")
-    st.markdown("### Why this setup?"); st.write(p.get("reason"))
-    if beginner:
-        st.markdown("## 🛡️ Beginner Trade Check")
-        if r["safety"]["safe"]: st.success("Passed the additional beginner safety checks. This still does not guarantee a profitable trade.")
-        else: st.error("Did not pass all beginner safety checks. Treat this as WAIT / NO TRADE until conditions improve.")
-        for status,title,msg in r["safety"]["checks"]:
-            if status=="PASS": st.success(f"**{title} — PASS**  \\n{msg}")
-            elif status=="WAIT": st.warning(f"**{title} — WAIT**  \\n{msg}")
-            else: st.error(f"**{title} — STOP**  \\n{msg}")
-    st.markdown("## Market Structure")
-    for label,x in [("5 Minute",r["a5"]),("30 Minute",r["a30"]),("Daily",r["ad"])]:
-        with st.expander(label,expanded=True):
-            a,b,c,d,e=st.columns(5); a.metric("Trend",x["trend"]); b.metric("RSI",num(x["rsi"],1)); c.metric("ADX",num(x["adx"],1)); d.metric("EMA20",money(x["ema20"])); e.metric("EMA50",money(x["ema50"]))
-    a,b=st.columns(2); a.metric("Recent Support",money(r["sup"])); b.metric("Recent Resistance",money(r["res"]))
-    st.caption(f"Last analysis: {r['time']} IST. Instrument, contract, quote and candle data are sourced through Upstox.")
-    st.caption("Note: Upstox documents the put/call option-chain endpoint as unavailable for MCX, so this v1 deliberately focuses on MCX futures rather than pretending to have MCX option-chain data.")
+
+    resolved = result[
+        "resolved"
+    ]
+
+    option_df = result[
+        "option_df"
+    ]
+
+    underlying_quote = result[
+        "underlying_quote"
+    ]
+
+    underlying_price = result[
+        "underlying_price"
+    ]
+
+    structure = result[
+        "structure"
+    ]
+
+    plan = result[
+        "plan"
+    ]
+
+    selected = result[
+        "selected_option"
+    ]
+
+
+    # ============================================================
+    # OPTION SERIES
+    # ============================================================
+
+    st.markdown(
+        "## 📅 Selected MCX Option Series"
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Commodity",
+        resolved.get(
+            "symbol",
+            "—"
+        )
+    )
+
+    c2.metric(
+        "Expiry",
+        resolved.get(
+            "expiry",
+            "—"
+        )
+    )
+
+    c3.metric(
+        "Underlying LTP",
+        fmt_money(
+            underlying_price
+        )
+    )
+
+    c4.metric(
+        "Options Found",
+        str(
+            len(option_df)
+        )
+    )
+
+
+    # ============================================================
+    # LIVE UNDERLYING
+    # ============================================================
+
+    st.markdown(
+        "## 📊 Live Underlying Market"
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "LTP",
+        fmt_money(
+            underlying_quote.get(
+                "ltp"
+            )
+        )
+    )
+
+    c2.metric(
+        "Day High",
+        fmt_money(
+            underlying_quote.get(
+                "high"
+            )
+        )
+    )
+
+    c3.metric(
+        "Day Low",
+        fmt_money(
+            underlying_quote.get(
+                "low"
+            )
+        )
+    )
+
+    c4.metric(
+        "Volume",
+        fmt_number(
+            underlying_quote.get(
+                "volume"
+            ),
+            0
+        )
+    )
+
+
+    # ============================================================
+    # OPTION STRUCTURE
+    # ============================================================
+
+    st.markdown(
+        "## 🧱 Option Market Structure"
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "ATM Strike",
+        fmt_number(
+            structure.get(
+                "atm"
+            ),
+            2
+        )
+    )
+
+    c2.metric(
+        "PCR (OI)",
+        fmt_number(
+            structure.get(
+                "pcr"
+            ),
+            2
+        )
+    )
+
+    c3.metric(
+        "Put OI / Support",
+        fmt_number(
+            structure.get(
+                "support"
+            ),
+            2
+        )
+    )
+
+    c4.metric(
+        "Call OI / Resistance",
+        fmt_number(
+            structure.get(
+                "resistance"
+            ),
+            2
+        )
+
+
+    # ============================================================
+    # DECISION
+    # ============================================================
+
+    st.markdown(
+        "## 🎯 Selected Option Trade Plan"
+    )
+
+    decision = plan.get(
+        "decision",
+        "NO TRADE"
+    )
+
+    if decision == "CALL BUY":
+
+        st.success(
+            "🟢 CALL BUY SETUP"
+        )
+
+    elif decision == "PUT BUY":
+
+        st.warning(
+            "🔴 PUT BUY SETUP"
+        )
+
+    else:
+
+        st.info(
+            "⚪ NO TRADE"
+        )
+
+
+    # ============================================================
+    # SELECTED OPTION
+    # ============================================================
+
+    if selected:
+
+        st.markdown(
+            f"### "
+            f"{selected.get('trading_symbol', 'Selected Option')}"
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "Option",
+            selected.get(
+                "option_type",
+                "—"
+            )
+        )
+
+        c2.metric(
+            "Strike",
+            fmt_money(
+                selected.get(
+                    "strike"
+                )
+            )
+        )
+
+        c3.metric(
+            "Premium",
+            fmt_money(
+                selected.get(
+                    "ltp"
+                )
+            )
+        )
+
+        c4.metric(
+            "Lot Size",
+            fmt_number(
+                selected.get(
+                    "lot_size"
+                ),
+                0
+            )
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "Delta",
+            fmt_number(
+                selected.get(
+                    "delta"
+                ),
+                3
+            )
+        )
+
+        iv = safe_float(
+            selected.get(
+                "iv"
+            )
+        )
+
+        c2.metric(
+            "IV",
+            f"{iv:.2f}%"
+            if np.isfinite(iv)
+            else "—"
+        )
+
+        pop = safe_float(
+            selected.get(
+                "pop"
+            )
+        )
+
+        c3.metric(
+            "Option PoP",
+            f"{pop:.1f}%"
+            if np.isfinite(pop)
+            else "—"
+        )
+
+        c4.metric(
+            "OI",
+            fmt_number(
+                selected.get(
+                    "oi"
+                ),
+                0
+            )
+        )
+
+
+    # ============================================================
+    # TRADE LEVELS
+    # ============================================================
+
+    if decision in {
+        "CALL BUY",
+        "PUT BUY"
+    }:
+
+        st.markdown(
+            "### 💰 Option Trade Levels"
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "Entry",
+            fmt_money(
+                plan.get(
+                    "entry"
+                )
+            )
+        )
+
+        c2.metric(
+            "Stop Loss",
+            fmt_money(
+                plan.get(
+                    "sl"
+                )
+            )
+        )
+
+        c3.metric(
+            "Target 1",
+            fmt_money(
+                plan.get(
+                    "t1"
+                )
+            )
+        )
+
+        c4.metric(
+            "Target 2",
+            fmt_money(
+                plan.get(
+                    "t2"
+                )
+            )
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "Max Loss / 1 Lot",
+            fmt_money(
+                plan.get(
+                    "max_loss"
+                )
+            )
+        )
+
+        c2.metric(
+            "T1 Potential / 1 Lot",
+            fmt_money(
+                plan.get(
+                    "t1_pnl"
+                )
+            )
+        )
+
+        c3.metric(
+            "T2 Potential / 1 Lot",
+            fmt_money(
+                plan.get(
+                    "t2_pnl"
+                )
+            )
+        )
+
+        c4.metric(
+            "Model PoP",
+            f"{safe_float(plan.get('pop'), 0):.1f}%"
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "Risk / Reward T1",
+            (
+                f"{safe_float(plan.get('rr1'), 0):.2f}R"
+            )
+        )
+
+        c2.metric(
+            "Risk / Reward T2",
+            (
+                f"{safe_float(plan.get('rr2'), 0):.2f}R"
+            )
+        )
+
+        c3.metric(
+            "Quality",
+            (
+                f"{safe_float(plan.get('quality'), 0):.0f}/100"
+            )
+        )
+
+        st.caption(
+            "PoP source: "
+            f"{plan.get('pop_source', 'Model')}. "
+            "PoP is not a guarantee of profit."
+        )
+
+
+    # ============================================================
+    # REASON
+    # ============================================================
+
+    st.markdown(
+        "### 💡 Why this setup?"
+    )
+
+    st.write(
+        plan.get(
+            "reason",
+            "No additional explanation available."
+        )
+    )
+
+
+    # ============================================================
+    # BEGINNER SAFETY
+    # ============================================================
+
+    if beginner_mode:
+
+        st.markdown(
+            "## 🛡️ Beginner Trade Check"
+        )
+
+        if result[
+            "safety"
+        ]["safe"]:
+
+            st.success(
+                "Passed the additional beginner "
+                "safety checks. This still does "
+                "not guarantee a profitable trade."
+            )
+
+        else:
+
+            st.error(
+                "Did not pass all beginner safety "
+                "checks. Treat this as WAIT / "
+                "NO TRADE until conditions improve."
+            )
+
+        for (
+            status,
+            title,
+            message
+        ) in result[
+            "safety"
+        ]["checks"]:
+
+            if status == "PASS":
+
+                st.success(
+                    f"**{title} — PASS**\n\n"
+                    f"{message}"
+                )
+
+            elif status == "WAIT":
+
+                st.warning(
+                    f"**{title} — WAIT**\n\n"
+                    f"{message}"
+                )
+
+            else:
+
+                st.error(
+                    f"**{title} — STOP**\n\n"
+                    f"{message}"
+                )
+
+
+    # ============================================================
+    # OPTION SNAPSHOT
+    # ============================================================
+
+    st.markdown(
+        "## 📋 MCX Option Snapshot"
+    )
+
+    display = option_df[
+        [
+            "option_type",
+            "strike",
+            "ltp",
+            "oi",
+            "volume",
+            "iv",
+            "delta",
+            "pop"
+        ]
+    ].copy()
+
+    display = display.rename(
+        columns={
+            "option_type": "Type",
+            "strike": "Strike",
+            "ltp": "LTP",
+            "oi": "OI",
+            "volume": "Volume",
+            "iv": "IV",
+            "delta": "Delta",
+            "pop": "PoP",
+        }
+    )
+
+    st.dataframe(
+        display.sort_values(
+            [
+                "Strike",
+                "Type"
+            ]
+        ),
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+    # ============================================================
+    # TECHNICALS
+    # ============================================================
+
+    st.markdown(
+        "## 📈 Underlying Technical Analysis"
+    )
+
+    technical_sets = [
+        (
+            "5 Minute",
+            result["analysis_5m"]
+        ),
+        (
+            "30 Minute",
+            result["analysis_30m"]
+        ),
+        (
+            "Daily",
+            result["analysis_daily"]
+        ),
+    ]
+
+    for label, analysis in technical_sets:
+
+        with st.expander(
+            label,
+            expanded=True
+        ):
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+
+            c1.metric(
+                "Trend",
+                analysis.get(
+                    "trend",
+                    "UNKNOWN"
+                )
+            )
+
+            c2.metric(
+                "Score",
+                f"{analysis.get('score', 0)}/100"
+            )
+
+            c3.metric(
+                "RSI",
+                fmt_number(
+                    analysis.get(
+                        "rsi"
+                    ),
+                    1
+                )
+            )
+
+            c4.metric(
+                "ADX",
+                fmt_number(
+                    analysis.get(
+                        "adx"
+                    ),
+                    1
+                )
+            )
+
+            c5.metric(
+                "ATR",
+                fmt_money(
+                    analysis.get(
+                        "atr"
+                    )
+                )
+            )
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric(
+                "EMA20",
+                fmt_money(
+                    analysis.get(
+                        "ema20"
+                    )
+                )
+            )
+
+            c2.metric(
+                "EMA50",
+                fmt_money(
+                    analysis.get(
+                        "ema50"
+                    )
+                )
+            )
+
+            c3.metric(
+                "VWAP",
+                fmt_money(
+                    analysis.get(
+                        "vwap"
+                    )
+                )
+
+
+    # ============================================================
+    # TECHNICAL DATA WARNINGS
+    # ============================================================
+
+    technical_errors = result.get(
+        "technical_errors",
+        []
+    )
+
+    if technical_errors:
+
+        st.warning(
+            "Some underlying technical data "
+            "was temporarily unavailable. "
+            "The option analysis was still "
+            "completed using the data that "
+            "Upstox returned."
+        )
+
+
+    # ============================================================
+    # IMPORTANT
+    # ============================================================
+
+    st.markdown(
+        "## ℹ️ Important"
+    )
+
+    st.caption(
+        "This is an MCX OPTION-ONLY application. "
+        "It does not resolve an MCX futures "
+        "contract for trading."
+    )
+
+    st.caption(
+        "MCX CE/PE contracts are discovered "
+        "directly through Upstox Instrument Search."
+    )
+
+    st.caption(
+        "The option contract's underlying_key "
+        "is used only for underlying price and "
+        "technical analysis."
+    )
+
+    st.caption(
+        "Upstox currently documents the standard "
+        "Put/Call Option Chain endpoint as "
+        "unavailable for MCX. Therefore this "
+        "application reconstructs the option view "
+        "from individual MCX CE/PE contracts, "
+        "live quotes and Option Greek data."
+    )
+
+    st.caption(
+        "Last analysis: "
+        f"{result.get('analysis_time', '—')} IST"
+    )
+
+    st.caption(
+        "Data source: Upstox."
+    )
+```
