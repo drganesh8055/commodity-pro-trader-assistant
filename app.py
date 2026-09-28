@@ -3114,48 +3114,6 @@ else:
     st.markdown("<div class='fo-section'>WHY THIS DECISION?</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='fo-why'><div class='fo-why-line'>{plan.get('reason','No additional explanation available.')}</div></div>",unsafe_allow_html=True)
 
-    # OPTION SNAPSHOT
-    st.markdown("<div class='fo-section'>MCX OPTION SNAPSHOT</div>", unsafe_allow_html=True)
-    # Render the complete option snapshot as a responsive HTML table instead of
-    # the Streamlit dataframe canvas. This prevents columns from being hidden
-    # or compressed when the browser width changes.
-    snap_cols = ["option_type","strike","ltp","oi","volume","iv","delta","pop"]
-    snap = option_df[[c for c in snap_cols if c in option_df.columns]].copy()
-    snap = snap.sort_values(["strike","option_type"]).reset_index(drop=True)
-    headers = {"option_type":"Type","strike":"Strike","ltp":"LTP","oi":"OI","volume":"Volume","iv":"IV %","delta":"Delta","pop":"PoP %"}
-    table = "<div class='fo-snapshot-wrap'><table class='fo-snapshot-table'><thead><tr>"
-    for c in snap.columns:
-        table += f"<th>{headers.get(c,c.upper())}</th>"
-    table += "</tr></thead><tbody>"
-    for _, row in snap.iterrows():
-        typ = str(row.get("option_type","—"))
-        cls = "ce" if typ == "CE" else ("pe" if typ == "PE" else "")
-        table += "<tr>"
-        for c in snap.columns:
-            v = row.get(c)
-            if c == "option_type":
-                txt = typ
-            elif c == "strike":
-                txt = fmt_number(v,2)
-            elif c == "ltp":
-                txt = fmt_money(v)
-            elif c in ("oi","volume"):
-                txt = fmt_number(v,0)
-            elif c == "iv":
-                txt = fmt_number(v,2)
-            elif c == "delta":
-                txt = fmt_number(v,3)
-            elif c == "pop":
-                txt = fmt_number(v,1) + "%" if np.isfinite(safe_float(v)) else "—"
-            else:
-                txt = str(v)
-            cell_cls = f" class='{cls}'" if c == "option_type" else ""
-            table += f"<td{cell_cls}>{txt}</td>"
-        table += "</tr>"
-    table += "</tbody></table></div>"
-    st.markdown(table, unsafe_allow_html=True)
-    st.markdown(f"<div class='fo-data-note'>Showing all {len(snap)} active CE/PE contracts for the selected expiry. Scroll horizontally only if your screen is narrower than the full table.</div>", unsafe_allow_html=True)
-
     # TECHNICALS
     st.markdown("<div class='fo-section'>UNDERLYING TECHNICAL ANALYSIS</div>", unsafe_allow_html=True)
     for label,analysis in [("5 Minute",result["analysis_5m"]),("30 Minute",result["analysis_30m"]),("Daily",result["analysis_daily"])]:
