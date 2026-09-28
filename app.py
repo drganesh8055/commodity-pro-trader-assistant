@@ -17,8 +17,6 @@
 
 import time
 import threading
-import gzip
-import json
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Any
@@ -287,106 +285,16 @@ def _search_instrument_rows(query, instrument_type=None, expiry=None):
     return data if isinstance(data, list) else []
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def load_mcx_instrument_master():
-    """Load Upstox official MCX BOD instrument master.
-
-    This is used as the primary discovery source because MCX commodity
-    option availability can be inconsistent when discovered through the
-    free-text Instrument Search API. The master contains the actual live
-    MCX_FO CE/PE contracts and their underlying_key values.
-
-    IMPORTANT: only CE/PE rows are ever returned by the filtering layer;
-    futures are never selected or used for trading.
-    """
-    url = "https://assets.upstox.com/market-quote/instruments/exchange/MCX.json.gz"
-
-    try:
-        response = requests.get(url, timeout=45)
-        response.raise_for_status()
-        raw = response.content
-
-        try:
-            raw = gzip.decompress(raw)
-        except (OSError, gzip.BadGzipFile):
-            # Some environments/proxies transparently decompress the file.
-            pass
-
-        payload = json.loads(raw.decode("utf-8"))
-        if not isinstance(payload, list):
-            raise RuntimeError("Upstox MCX instrument master returned an unexpected format.")
-
-        return payload
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Unable to download the Upstox MCX instrument master: {exc}") from exc
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Upstox MCX instrument master could not be decoded.") from exc
-
-
-def _row_commodity_matches(row, symbol):
-    if not isinstance(row, dict):
-        return False
-
-    target = normalize_text(symbol)
-
-    fields = [
-        normalize_text(row.get("underlying_symbol", "")),
-        normalize_text(row.get("name", "")),
-        normalize_text(row.get("short_name", "")),
-    ]
-
-    # Exact underlying/name matches first. This prevents SILVER from
-    # accidentally selecting SILVERM contracts.
-    if target and any(value == target for value in fields if value):
-        return True
-
-    trading = normalize_text(row.get("trading_symbol", ""))
-    return bool(target and trading.startswith(target + " "))
-
-
-def _master_mcx_options(symbol):
-    """Return active MCX CE/PE rows for one commodity from the BOD master."""
-    symbol = normalize_symbol(symbol)
-    today = date.today().isoformat()
-    rows = []
-
-    for row in load_mcx_instrument_master():
-        if not isinstance(row, dict):
-            continue
-
-        if str(row.get("exchange", "")).upper() != "MCX":
-            continue
-        if str(row.get("segment", "")).upper() != "MCX_FO":
-            continue
-        if str(row.get("instrument_type", "")).upper() not in {"CE", "PE"}:
-            continue
-        if not _row_commodity_matches(row, symbol):
-            continue
-
-        key = str(row.get("instrument_key", "")).strip()
-        underlying_key = str(row.get("underlying_key", "")).strip()
-        expiry = expiry_string(row.get("expiry"))
-        strike = safe_float(row.get("strike_price"))
-
-        if not key or not underlying_key or not expiry or expiry < today:
-            continue
-        if not np.isfinite(strike):
-            continue
-
-        rows.append(row)
-
-    return rows
-
-
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False)
 def search_mcx_options(symbol, option_type, expiry_keyword=None):
-    """Discover MCX CE/PE contracts without resolving any future.
+    """
+    Robust MCX CE/PE discovery.
 
-    Primary source: official Upstox MCX instrument master.
-    Secondary source: Upstox Instrument Search API.
-
-    The master-first approach fixes cases such as SILVER where the
-    free-text search may not return the active MCX option series.
+    Important:
+    We never ask Upstox for FUT and never return FUT rows.
+    We search using several harmless textual variants because
+    Upstox may index commodity names as CRUDE, CRUDE OIL,
+    CRUDEOIL, etc.
     """
     symbol = normalize_symbol(symbol)
     option_type = str(option_type or "").upper().strip()
@@ -394,41 +302,19 @@ def search_mcx_options(symbol, option_type, expiry_keyword=None):
     if option_type not in ("CE", "PE"):
         return []
 
-    # ------------------------------------------------------------
-    # PRIMARY: official MCX instrument master
-    # ------------------------------------------------------------
-    try:
-        master_rows = [
-            row for row in _master_mcx_options(symbol)
-            if str(row.get("instrument_type", "")).upper() == option_type
-        ]
-
-        if master_rows:
-            if expiry_keyword:
-                # Instrument-master rows have real expiry dates, so apply
-                # relative expiry keywords locally instead of relying on
-                # the search API's interpretation for MCX.
-                expiries = sorted({expiry_string(r.get("expiry")) for r in master_rows})
-                selected_expiry = _select_expiry_for_keyword(expiries, expiry_keyword)
-                if selected_expiry:
-                    filtered = [r for r in master_rows if expiry_string(r.get("expiry")) == selected_expiry]
-                    if filtered:
-                        return filtered
-            return master_rows
-    except Exception:
-        # Fall through to the supported search API.
-        pass
-
-    # ------------------------------------------------------------
-    # SECONDARY: Instrument Search API
-    # ------------------------------------------------------------
+    # Text variants. The API supports partial, case-insensitive search.
     variants = {
         "GOLD": ["GOLD"],
         "GOLDM": ["GOLDM", "GOLD MINI", "GOLD"],
         "SILVER": ["SILVER"],
         "SILVERM": ["SILVERM", "SILVER MINI", "SILVER"],
         "CRUDEOIL": ["CRUDEOIL", "CRUDE OIL", "CRUDE"],
-        "CRUDEOILMINI": ["CRUDEOILMINI", "CRUDE OIL MINI", "CRUDE MINI", "CRUDE"],
+        "CRUDEOILMINI": [
+            "CRUDEOILMINI",
+            "CRUDE OIL MINI",
+            "CRUDE MINI",
+            "CRUDE",
+        ],
         "NATURALGAS": ["NATURALGAS", "NATURAL GAS", "NAT GAS", "NATGAS"],
         "COPPER": ["COPPER"],
         "ZINC": ["ZINC"],
@@ -438,82 +324,70 @@ def search_mcx_options(symbol, option_type, expiry_keyword=None):
     }.get(symbol, [symbol])
 
     rows = []
+
+    # First pass: specific option type + optional expiry.
     for query in variants:
         try:
-            rows.extend(_search_instrument_rows(query, instrument_type=option_type, expiry=expiry_keyword))
+            rows.extend(
+                _search_instrument_rows(
+                    query,
+                    instrument_type=option_type,
+                    expiry=expiry_keyword,
+                )
+            )
         except Exception:
             continue
 
+    # Second pass: if an expiry-filtered search returned nothing,
+    # search without expiry and filter dates locally.
     if not rows:
         for query in variants:
             try:
-                rows.extend(_search_instrument_rows(query, instrument_type=option_type, expiry=None))
+                rows.extend(
+                    _search_instrument_rows(
+                        query,
+                        instrument_type=option_type,
+                        expiry=None,
+                    )
+                )
             except Exception:
                 continue
 
+    # Final safety filter: only MCX_FO + requested CE/PE.
     cleaned = []
     seen = set()
+
     for row in rows:
         if not isinstance(row, dict):
             continue
-        if str(row.get("exchange", "")).upper() != "MCX":
+
+        exchange = str(row.get("exchange", "")).upper()
+        segment = str(row.get("segment", "")).upper()
+        inst_type = str(row.get("instrument_type", "")).upper()
+
+        if exchange != "MCX":
             continue
-        if str(row.get("segment", "")).upper() != "MCX_FO":
+
+        if segment != "MCX_FO":
             continue
-        if str(row.get("instrument_type", "")).upper() != option_type:
+
+        if inst_type != option_type:
             continue
-        if not _row_commodity_matches(row, symbol):
-            continue
+
         key = str(row.get("instrument_key", "")).strip()
+
         if not key or key in seen:
             continue
-        if not str(row.get("underlying_key", "")).strip():
+
+        # Explicitly reject anything that looks like a future.
+        trading_symbol = str(row.get("trading_symbol", "")).upper()
+        if inst_type == "FUT" or " FUT " in f" {trading_symbol} ":
             continue
-        expiry = expiry_string(row.get("expiry"))
-        if not expiry or expiry < date.today().isoformat():
-            continue
+
         seen.add(key)
         cleaned.append(row)
 
     return cleaned
-
-
-def _select_expiry_for_keyword(expiries, keyword):
-    """Map Upstox-style relative expiry keywords to actual MCX dates."""
-    valid = sorted(str(x) for x in expiries if x)
-    if not valid:
-        return ""
-
-    today = date.today()
-    future = []
-    for value in valid:
-        try:
-            d = date.fromisoformat(value)
-        except ValueError:
-            continue
-        if d >= today:
-            future.append(d)
-
-    if not future:
-        return ""
-
-    key = str(keyword or "").lower().strip()
-    if key in {"current_month", "this_month", "near_month", "monthly"}:
-        same_month = [d for d in future if d.year == today.year and d.month == today.month]
-        return min(same_month).isoformat() if same_month else min(future).isoformat()
-    if key in {"next_month", "far_month"}:
-        next_month = [d for d in future if (d.year, d.month) > (today.year, today.month)]
-        return min(next_month).isoformat() if next_month else min(future).isoformat()
-    if key in {"current_week", "this_week", "near_week", "weekly", "next_week", "far_week"}:
-        return min(future).isoformat()
-
-    # Specific date is also accepted.
-    try:
-        requested = date.fromisoformat(key)
-        candidates = [d for d in future if d == requested]
-        return requested.isoformat() if candidates else ""
-    except ValueError:
-        return ""
 
 def option_matches_commodity(
     row,
@@ -579,24 +453,10 @@ def option_matches_commodity(
 
 
 def expiry_string(value):
-    if value is None or value == "":
+    if not value:
         return ""
 
-    # Current Instrument Search responses use YYYY-MM-DD strings, while
-    # the downloadable BOD instrument master may contain epoch milliseconds.
-    if isinstance(value, (int, float)) and np.isfinite(float(value)):
-        try:
-            ts = float(value)
-            if ts > 10_000_000_000:
-                ts = ts / 1000.0
-            return datetime.fromtimestamp(ts, tz=IST).date().isoformat()
-        except Exception:
-            pass
-
-    text = str(value).strip()
-    if not text:
-        return ""
-    return text[:10]
+    return str(value)[:10]
 
 
 def clean_options(
@@ -673,6 +533,7 @@ def deduplicate_contracts(rows):
     ttl=90,
     show_spinner=False
 )
+@st.cache_data(ttl=90, show_spinner=False)
 def resolve_mcx_options(symbol):
     """
     Resolve the nearest active MCX CE/PE expiry without resolving
@@ -2063,27 +1924,35 @@ def build_trade_plan(
         "Conservative": (
             0.65,
             1.20,
-            1.60
+            1.60,
+            2.00,
+            2.40
         ),
 
         "Balanced": (
             0.55,
             1.35,
-            1.90
+            1.90,
+            2.50,
+            3.10
         ),
 
         "Aggressive": (
             0.45,
             1.50,
-            2.20
+            2.20,
+            3.00,
+            3.80
         ),
     }
 
-    sl_percent, t1_percent, t2_percent = (
-        profiles[
-            risk_profile
-        ]
-    )
+    (
+        sl_percent,
+        t1_percent,
+        t2_percent,
+        t3_percent,
+        t4_percent
+    ) = profiles[risk_profile]
 
     entry = premium
 
@@ -2112,6 +1981,22 @@ def build_trade_plan(
         )
     )
 
+    target_3 = (
+        entry
+        * (
+            1
+            + t3_percent
+        )
+    )
+
+    target_4 = (
+        entry
+        * (
+            1
+            + t4_percent
+        )
+    )
+
     lot_size = safe_float(
         selected_option.get(
             "lot_size",
@@ -2135,6 +2020,16 @@ def build_trade_plan(
         - entry
     )
 
+    profit_t3_per_unit = (
+        target_3
+        - entry
+    )
+
+    profit_t4_per_unit = (
+        target_4
+        - entry
+    )
+
     max_loss = (
         risk_per_unit
         * lot_size
@@ -2147,6 +2042,16 @@ def build_trade_plan(
 
     t2_profit = (
         profit_t2_per_unit
+        * lot_size
+    )
+
+    t3_profit = (
+        profit_t3_per_unit
+        * lot_size
+    )
+
+    t4_profit = (
+        profit_t4_per_unit
         * lot_size
     )
 
@@ -2216,15 +2121,23 @@ def build_trade_plan(
         "sl": stop_loss,
         "t1": target_1,
         "t2": target_2,
+        "t3": target_3,
+        "t4": target_4,
         "lot": lot_size,
         "risk_per_unit": risk_per_unit,
         "t1_profit_per_unit":
             profit_t1_per_unit,
         "t2_profit_per_unit":
             profit_t2_per_unit,
+        "t3_profit_per_unit":
+            profit_t3_per_unit,
+        "t4_profit_per_unit":
+            profit_t4_per_unit,
         "max_loss": max_loss,
         "t1_pnl": t1_profit,
         "t2_pnl": t2_profit,
+        "t3_pnl": t3_profit,
+        "t4_pnl": t4_profit,
         "rr1": rr1,
         "rr2": rr2,
         "pop": pop,
@@ -2934,6 +2847,36 @@ if analyze_button:
 
 
 # ================================================================
+# F&O-STYLE COMMODITY DASHBOARD — VISUAL ONLY
+# ================================================================
+st.markdown("""
+<style>
+.stApp{background:linear-gradient(180deg,#eef6ff 0%,#f7f9fc 42%,#eef8f4 100%);}
+.block-container{max-width:1520px;padding-top:1.4rem;}
+section[data-testid="stSidebar"]{background:linear-gradient(180deg,#f0f7ff 0%,#f8fbff 48%,#f2fbf6 100%);border-right:1px solid #cbdcf2;}
+section[data-testid="stSidebar"] h2{color:#12395b!important;}
+.stButton>button{border:1px solid #93c5fd!important;border-radius:10px!important;font-weight:800!important;background:linear-gradient(180deg,#eff6ff,#dbeafe)!important;color:#174ea6!important;box-shadow:0 3px 10px rgba(37,99,235,.10)!important;}
+.stButton>button[kind="primary"]{background:linear-gradient(135deg,#2563eb,#1d4ed8)!important;color:#fff!important;border-color:#1d4ed8!important;}
+.stTextInput input{border:2px solid #bfdbfe!important;border-radius:10px!important;background:#f8fbff!important;font-weight:700!important;}
+.fo-hero{background:linear-gradient(135deg,#0b1f33 0%,#123b5d 55%,#155e75 100%);border-radius:20px;padding:24px 28px;color:#fff;box-shadow:0 10px 30px rgba(15,45,70,.14);margin:2px 0 18px;position:relative;overflow:hidden;}
+.fo-hero:after{content:"";position:absolute;right:-90px;top:-120px;width:300px;height:300px;border-radius:50%;background:rgba(255,255,255,.055);}
+.fo-hero-top{display:flex;align-items:center;justify-content:space-between;gap:18px;position:relative;z-index:1;}
+.fo-brand{font-size:32px;font-weight:900;letter-spacing:-.6px;line-height:1.1;}.fo-tagline{font-size:15px;color:rgba(255,255,255,.72);margin-top:6px;}.fo-live{padding:10px 14px;border-radius:12px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.15);text-align:right;min-width:150px;}.fo-live b{display:block;font-size:15px}.fo-live small{display:block;margin-top:4px;font-size:13px;color:rgba(255,255,255,.68)}
+.fo-section{font-size:15px;font-weight:900;letter-spacing:1px;color:#0f4c81;margin:22px 2px 9px;display:flex;align-items:center;gap:9px}.fo-section:before{content:"";width:7px;height:22px;border-radius:5px;background:linear-gradient(180deg,#2563eb,#06b6d4);display:inline-block}.fo-section:after{content:"";height:1px;background:linear-gradient(90deg,#bfdbfe,#e2e8f0,transparent);flex:1}
+.fo-instrument{display:flex;align-items:end;justify-content:space-between;gap:14px;background:linear-gradient(100deg,#fff,#f0f7ff 55%,#effcf5);border:2px solid #c9dff4;border-radius:15px;padding:15px 18px;margin-bottom:14px;box-shadow:0 5px 15px rgba(15,23,42,.055)}.fo-symbol{font-size:27px;font-weight:900;color:#0f3b63}.fo-symbol-note{font-size:14px;color:#64748b;margin-top:3px}.fo-regime{font-size:13px;font-weight:850;color:#6d28d9;background:#ede9fe;border:1px solid #c4b5fd;padding:7px 10px;border-radius:20px}
+.fo-metrics{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:10px}.fo-metric{background:#fff;border:1px solid #d7e2ee;border-radius:14px;padding:14px 13px;min-height:94px;box-shadow:0 5px 15px rgba(15,23,42,.055)}.fo-metric-label{font-size:12px;font-weight:900;color:#64748b;letter-spacing:.8px}.fo-metric-value{font-size:22px;font-weight:900;color:#172b4d;margin-top:8px;line-height:1.1;white-space:nowrap}.fo-metric-note{font-size:12px;color:#64748b;margin-top:7px}.fo-metric.spot{background:linear-gradient(145deg,#e0f2fe,#fff);border-color:#7dd3fc}.fo-metric.support{background:linear-gradient(145deg,#ecfdf5,#fff);border-left:6px solid #16a34a}.fo-metric.resistance{background:linear-gradient(145deg,#fff1f2,#fff);border-left:6px solid #dc2626}
+.fo-decision{border-radius:19px;padding:22px;border:2px solid #e3e7eb;box-shadow:0 10px 26px rgba(15,23,42,.07);background:#fff}.fo-decision.call{background:linear-gradient(135deg,#dcfce7,#f0fdf4 45%,#fff);border-color:#4ade80}.fo-decision.put{background:linear-gradient(135deg,#ffe4e6,#fff1f2 45%,#fff);border-color:#fb7185}.fo-decision.neutral{background:linear-gradient(135deg,#fef3c7,#fffbeb 45%,#fff);border-color:#fbbf24}.fo-decision-row{display:flex;justify-content:space-between;align-items:center;gap:15px}.fo-decision-label{font-size:13px;font-weight:900;color:#64748b;letter-spacing:1px}.fo-decision-title{font-size:37px;font-weight:950;letter-spacing:-1px;margin-top:4px}.fo-decision.call .fo-decision-title{color:#087f3e}.fo-decision.put .fo-decision-title{color:#c81e3a}.fo-decision.neutral .fo-decision-title{color:#92400e}.fo-decision-note{font-size:14px;color:#667085;margin-top:6px}.fo-score-ring{min-width:100px;text-align:center;border-radius:15px;background:rgba(255,255,255,.72);border:1px solid rgba(0,0,0,.06);padding:11px 13px}.fo-score-ring b{display:block;font-size:28px;color:#182230}.fo-score-ring span{font-size:12px;color:#98a2b3;font-weight:800}
+.fo-decision-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:17px}.fo-decision-cell{background:rgba(255,255,255,.72);border:1px solid rgba(16,42,67,.07);border-radius:11px;padding:11px;text-align:center}.fo-decision-cell span{display:block;font-size:12px;font-weight:900;color:#98a2b3}.fo-decision-cell b{display:block;font-size:18px;color:#182230;margin-top:5px}
+.fo-plan-head{display:flex;align-items:center;justify-content:space-between;gap:14px;background:linear-gradient(100deg,#fff,#eff6ff);border:2px solid #c7d7ea;border-radius:16px 16px 0 0;padding:17px 19px}.fo-plan-action{font-size:13px;font-weight:900;color:#2563eb;letter-spacing:.8px}.fo-plan-contract{font-size:25px;font-weight:900;color:#0f3b63;margin-top:3px}.fo-plan-pop{font-size:22px;font-weight:900;color:#087f3e;background:#dcfce7;border:1px solid #86efac;border-radius:999px;padding:7px 12px;white-space:nowrap}
+.fo-levels{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:7px;margin-top:9px}.fo-level{background:#fff;border:1px solid #d7e2ee;border-radius:13px;padding:11px 9px;min-height:112px;min-width:0;box-sizing:border-box;overflow:hidden;box-shadow:0 4px 12px rgba(15,23,42,.045)}.fo-level span{display:block;font-size:11px;color:#64748b;font-weight:900;letter-spacing:.45px;white-space:nowrap}.fo-level b{display:block;font-size:18px;color:#182230;margin-top:7px;white-space:nowrap}.fo-level small{display:block;font-size:11px;color:#64748b;margin-top:4px;line-height:1.25}.fo-level.entry{background:linear-gradient(180deg,#eff6ff,#fff);border-top:5px solid #2563eb}.fo-level.sl{background:linear-gradient(180deg,#fff1f2,#fff);border-top:5px solid #dc2626}.fo-level.t1{background:linear-gradient(180deg,#ecfdf5,#fff);border-top:5px solid #16a34a}.fo-level.t2{background:linear-gradient(180deg,#ecfeff,#fff);border-top:5px solid #0f766e}.fo-level.t3{background:linear-gradient(180deg,#ecfdf5,#fff);border-top:5px solid #059669}.fo-level.t4{background:linear-gradient(180deg,#d1fae5,#fff);border-top:5px solid #047857}.fo-level.greeks{background:linear-gradient(180deg,#f5f3ff,#fff);border-top:5px solid #7c3aed}.fo-level-pct{font-weight:900!important;font-size:13px!important}.fo-level-lot{font-weight:900!important;font-size:13px!important}.fo-level.sl .fo-level-pct,.fo-level.sl .fo-level-lot{color:#b91c1c!important}.fo-level.t1 .fo-level-pct,.fo-level.t1 .fo-level-lot,.fo-level.t2 .fo-level-pct,.fo-level.t2 .fo-level-lot,.fo-level.t3 .fo-level-pct,.fo-level.t3 .fo-level-lot,.fo-level.t4 .fo-level-pct,.fo-level.t4 .fo-level-lot{color:#15803d!important}
+.fo-risk-box{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin-top:12px}.fo-risk-cell{background:#fff;border:1px solid #d7e2ee;border-radius:11px;padding:10px;text-align:center}.fo-risk-cell span{display:block;font-size:10px;font-weight:900;color:#64748b}.fo-risk-cell b{display:block;font-size:17px;color:#172b4d;margin-top:4px}.fo-safety-banner{display:flex;align-items:center;justify-content:space-between;gap:14px;background:linear-gradient(135deg,#eff6ff,#f8fbff);border:1px solid #93c5fd;border-left:6px solid #2563eb;border-radius:14px;padding:14px 16px;margin:12px 0 16px}.fo-safety-banner b{font-size:16px;color:#12395b}.fo-safety-banner span{font-size:13px;color:#52657a;display:block;margin-top:3px}.fo-safety-badge{background:#dbeafe;color:#1d4ed8;border:1px solid #93c5fd;padding:7px 10px;border-radius:20px;font-size:12px;font-weight:900}.fo-check-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fo-check{background:#fff;border:2px solid #d7e2ee;border-radius:12px;padding:12px}.fo-check.pass{background:#ecfdf5;border-color:#4ade80}.fo-check.wait{background:#fffbeb;border-color:#fbbf24}.fo-check.fail{background:#fff1f2;border-color:#fb7185}.fo-check-top{display:flex;justify-content:space-between;gap:8px}.fo-check-name{font-weight:900;color:#172b4d}.fo-check-status{font-size:11px;font-weight:900;border-radius:8px;padding:4px 7px}.fo-check.pass .fo-check-status{background:#bbf7d0;color:#166534}.fo-check.wait .fo-check-status{background:#fde68a;color:#92400e}.fo-check.fail .fo-check-status{background:#fecdd3;color:#9f1239}.fo-check-detail{font-size:13px;color:#52657a;line-height:1.45;margin-top:7px}
+.fo-card-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.fo-card{background:#fff;border:1px solid #d7e2ee;border-radius:14px;padding:14px;box-shadow:0 4px 12px rgba(15,23,42,.04)}.fo-card-label{font-size:11px;color:#64748b;font-weight:900}.fo-card-value{font-size:21px;color:#172b4d;font-weight:900;margin-top:5px}.fo-why{background:#fff;border:2px solid #d7e2ee;border-radius:15px;padding:14px 17px;box-shadow:0 3px 12px rgba(16,42,67,.03)}.fo-why-line{padding:8px 2px;border-bottom:1px solid #e2e8f0;font-size:14px;color:#344054;line-height:1.5}.fo-why-line:last-child{border-bottom:0}.fo-footer{margin-top:22px;padding:13px 15px;border-radius:12px;background:linear-gradient(90deg,#e0f2fe,#ecfdf5);border:1px solid #bfdbfe;color:#475569;font-size:12px;line-height:1.6;text-align:center}
+@media(max-width:1050px){.fo-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.fo-levels{grid-template-columns:repeat(4,minmax(0,1fr))}.fo-card-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:720px){.fo-hero-top,.fo-plan-head,.fo-decision-row{flex-direction:column;align-items:flex-start}.fo-metrics,.fo-levels,.fo-risk-box,.fo-card-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.fo-decision-grid{grid-template-columns:repeat(2,1fr)}.fo-check-grid{grid-template-columns:1fr}.fo-brand{font-size:25px}}
+</style>
+""", unsafe_allow_html=True)
+
+# ================================================================
 # DISPLAY
 # ================================================================
 
@@ -2943,717 +2886,141 @@ result = st.session_state[
 
 
 if not result:
-
-    st.info(
-        "Enter a commodity and click "
-        "'Analyze Commodity Options'."
-    )
-
+    st.info("Enter a commodity and click 'Analyze Commodity Options'.")
 elif result.get("error"):
-
-    st.error(
-        result["error"]
-    )
-
+    st.error(result["error"])
 else:
+    resolved = result["resolved"]
+    option_df = result["option_df"]
+    underlying_quote = result["underlying_quote"]
+    underlying_price = result["underlying_price"]
+    structure = result["structure"]
+    plan = result["plan"]
+    selected = result["selected_option"]
+    decision = plan.get("decision", "NO TRADE")
 
-    resolved = result[
-        "resolved"
+    # HERO / INSTRUMENT HEADER
+    regime = "BULLISH" if result["analysis_5m"].get("trend") == "BULLISH" else ("BEARISH" if result["analysis_5m"].get("trend") == "BEARISH" else "MIXED")
+    st.markdown(f"""
+    <div class="fo-hero">
+      <div class="fo-hero-top">
+        <div><div class="fo-brand">🛢️ Commodity PRO Trader Assistant</div>
+        <div class="fo-tagline">MCX commodity OPTIONS only · Live Upstox data · CE/PE · Greeks · OI · technicals · risk plan</div></div>
+        <div class="fo-live"><b>● LIVE UPSTOX</b><small>{result.get('analysis_time','—')} IST</small></div>
+      </div>
+    </div>
+    <div class="fo-instrument">
+      <div><div class="fo-symbol">{resolved.get('symbol','—')} · MCX OPTIONS</div><div class="fo-symbol-note">Nearest active CE/PE series · Expiry {resolved.get('expiry','—')} · Futures are not used for trading</div></div>
+      <div class="fo-regime">MARKET REGIME · {regime}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    spot = safe_float(underlying_price)
+    prev = safe_float(underlying_quote.get("previous_close"), spot)
+    day_change = safe_float(underlying_quote.get("change"), spot - prev if np.isfinite(prev) else 0)
+    day_pct = day_change / prev * 100 if np.isfinite(prev) and prev else 0
+    metrics = [
+        ("SPOT", fmt_money(spot), f"{day_change:+.2f} ({day_pct:+.2f}%)", "spot"),
+        ("EXPIRY", resolved.get("expiry","—"), "Nearest active option expiry", ""),
+        ("PCR", fmt_number(structure.get("pcr"),2), "Put / Call OI", ""),
+        ("SUPPORT", fmt_number(structure.get("support"),2), "Put OI zone", "support"),
+        ("RESISTANCE", fmt_number(structure.get("resistance"),2), "Call OI zone", "resistance"),
+        ("OPTIONS", str(len(option_df)), "Active CE + PE contracts", ""),
+        ("LOT SIZE", fmt_number(selected.get("lot_size") if selected else np.nan,0), "1 option lot", ""),
     ]
-
-    option_df = result[
-        "option_df"
-    ]
-
-    underlying_quote = result[
-        "underlying_quote"
-    ]
-
-    underlying_price = result[
-        "underlying_price"
-    ]
-
-    structure = result[
-        "structure"
-    ]
-
-    plan = result[
-        "plan"
-    ]
-
-    selected = result[
-        "selected_option"
-    ]
-
-
-    # ============================================================
-    # OPTION SERIES
-    # ============================================================
-
-    st.markdown(
-        "## 📅 Selected MCX Option Series"
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "Commodity",
-        resolved.get(
-            "symbol",
-            "—"
-        )
-    )
-
-    c2.metric(
-        "Expiry",
-        resolved.get(
-            "expiry",
-            "—"
-        )
-    )
-
-    c3.metric(
-        "Underlying LTP",
-        fmt_money(
-            underlying_price
-        )
-    )
-
-    c4.metric(
-        "Options Found",
-        str(
-            len(option_df)
-        )
-    )
-
-
-    # ============================================================
-    # LIVE UNDERLYING
-    # ============================================================
-
-    st.markdown(
-        "## 📊 Live Underlying Market"
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "LTP",
-        fmt_money(
-            underlying_quote.get(
-                "ltp"
-            )
-        )
-    )
-
-    c2.metric(
-        "Day High",
-        fmt_money(
-            underlying_quote.get(
-                "high"
-            )
-        )
-    )
-
-    c3.metric(
-        "Day Low",
-        fmt_money(
-            underlying_quote.get(
-                "low"
-            )
-        )
-    )
-
-    c4.metric(
-        "Volume",
-        fmt_number(
-            underlying_quote.get(
-                "volume"
-            ),
-            0
-        )
-    )
-
-
-    # ============================================================
-    # OPTION STRUCTURE
-    # ============================================================
-
-    st.markdown(
-        "## 🧱 Option Market Structure"
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "ATM Strike",
-        fmt_number(
-            structure.get(
-                "atm"
-            ),
-            2
-        )
-    )
-
-    c2.metric(
-        "PCR (OI)",
-        fmt_number(
-            structure.get(
-                "pcr"
-            ),
-            2
-        )
-    )
-
-    c3.metric(
-        "Put OI / Support",
-        fmt_number(
-            structure.get(
-                "support"
-            ),
-            2
-        )
-    )
-
-    c4.metric(
-        "Call OI / Resistance",
-        fmt_number(
-            structure.get(
-                "resistance"
-            ),
-            2
-        )
-    )
-
-
-    # ============================================================
-    # DECISION
-    # ============================================================
-
-    st.markdown(
-        "## 🎯 Selected Option Trade Plan"
-    )
-
-    decision = plan.get(
-        "decision",
-        "NO TRADE"
-    )
-
-    if decision == "CALL BUY":
-
-        st.success(
-            "🟢 CALL BUY SETUP"
-        )
-
-    elif decision == "PUT BUY":
-
-        st.warning(
-            "🔴 PUT BUY SETUP"
-        )
-
-    else:
-
-        st.info(
-            "⚪ NO TRADE"
-        )
-
-
-    # ============================================================
-    # SELECTED OPTION
-    # ============================================================
-
-    if selected:
-
-        st.markdown(
-            f"### "
-            f"{selected.get('trading_symbol', 'Selected Option')}"
-        )
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Option",
-            selected.get(
-                "option_type",
-                "—"
-            )
-        )
-
-        c2.metric(
-            "Strike",
-            fmt_money(
-                selected.get(
-                    "strike"
-                )
-            )
-        )
-
-        c3.metric(
-            "Premium",
-            fmt_money(
-                selected.get(
-                    "ltp"
-                )
-            )
-        )
-
-        c4.metric(
-            "Lot Size",
-            fmt_number(
-                selected.get(
-                    "lot_size"
-                ),
-                0
-            )
-        )
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Delta",
-            fmt_number(
-                selected.get(
-                    "delta"
-                ),
-                3
-            )
-        )
-
-        iv = safe_float(
-            selected.get(
-                "iv"
-            )
-        )
-
-        c2.metric(
-            "IV",
-            f"{iv:.2f}%"
-            if np.isfinite(iv)
-            else "—"
-        )
-
-        pop = safe_float(
-            selected.get(
-                "pop"
-            )
-        )
-
-        c3.metric(
-            "Option PoP",
-            f"{pop:.1f}%"
-            if np.isfinite(pop)
-            else "—"
-        )
-
-        c4.metric(
-            "OI",
-            fmt_number(
-                selected.get(
-                    "oi"
-                ),
-                0
-            )
-        )
-
-
-    # ============================================================
-    # TRADE LEVELS
-    # ============================================================
-
-    if decision in {
-        "CALL BUY",
-        "PUT BUY"
-    }:
-
-        st.markdown(
-            "### 💰 Option Trade Levels"
-        )
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Entry",
-            fmt_money(
-                plan.get(
-                    "entry"
-                )
-            )
-        )
-
-        c2.metric(
-            "Stop Loss",
-            fmt_money(
-                plan.get(
-                    "sl"
-                )
-            )
-        )
-
-        c3.metric(
-            "Target 1",
-            fmt_money(
-                plan.get(
-                    "t1"
-                )
-            )
-        )
-
-        c4.metric(
-            "Target 2",
-            fmt_money(
-                plan.get(
-                    "t2"
-                )
-            )
-        )
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Max Loss / 1 Lot",
-            fmt_money(
-                plan.get(
-                    "max_loss"
-                )
-            )
-        )
-
-        c2.metric(
-            "T1 Potential / 1 Lot",
-            fmt_money(
-                plan.get(
-                    "t1_pnl"
-                )
-            )
-        )
-
-        c3.metric(
-            "T2 Potential / 1 Lot",
-            fmt_money(
-                plan.get(
-                    "t2_pnl"
-                )
-            )
-        )
-
-        c4.metric(
-            "Model PoP",
-            f"{safe_float(plan.get('pop'), 0):.1f}%"
-        )
-
-        c1, c2, c3 = st.columns(3)
-
-        c1.metric(
-            "Risk / Reward T1",
-            (
-                f"{safe_float(plan.get('rr1'), 0):.2f}R"
-            )
-        )
-
-        c2.metric(
-            "Risk / Reward T2",
-            (
-                f"{safe_float(plan.get('rr2'), 0):.2f}R"
-            )
-        )
-
-        c3.metric(
-            "Quality",
-            (
-                f"{safe_float(plan.get('quality'), 0):.0f}/100"
-            )
-        )
-
-        st.caption(
-            "PoP source: "
-            f"{plan.get('pop_source', 'Model')}. "
-            "PoP is not a guarantee of profit."
-        )
-
-
-    # ============================================================
-    # REASON
-    # ============================================================
-
-    st.markdown(
-        "### 💡 Why this setup?"
-    )
-
-    st.write(
-        plan.get(
-            "reason",
-            "No additional explanation available."
-        )
-    )
-
-
-    # ============================================================
-    # BEGINNER SAFETY
-    # ============================================================
+    html="<div class='fo-metrics'>"
+    for title,value,note,cls in metrics:
+        html += f"<div class='fo-metric {cls}'><div class='fo-metric-label'>{title}</div><div class='fo-metric-value'>{value}</div><div class='fo-metric-note'>{note}</div></div>"
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
     if beginner_mode:
+        st.markdown("<div class='fo-safety-banner'><div><b>🛡️ BEGINNER SAFETY + EXPLAINABILITY IS ON</b><span>Stricter execution filter, stronger confirmation and plain-English checks. This is decision support — not a guarantee of profit.</span></div><div class='fo-safety-badge'>SAFETY ON</div></div>", unsafe_allow_html=True)
 
-        st.markdown(
-            "## 🛡️ Beginner Trade Check"
-        )
+    # DECISION
+    st.markdown("<div class='fo-section'>TRADE DECISION</div>", unsafe_allow_html=True)
+    action_class = "call" if decision == "CALL BUY" else ("put" if decision == "PUT BUY" else "neutral")
+    pop = safe_float(plan.get("pop"),0)
+    quality = safe_float(plan.get("quality"),0)
+    contract = selected.get("trading_symbol","No executable option") if selected else "No executable setup"
+    note = {"CALL BUY":"Directional upside setup — execute only when the displayed confirmation conditions are satisfied.","PUT BUY":"Directional downside setup — execute only when the displayed confirmation conditions are satisfied.","NO TRADE":"No option setup currently meets the minimum quality, alignment and safety gates."}.get(decision,"No executable setup.")
+    st.markdown(f"""
+    <div class="fo-decision {action_class}">
+      <div class="fo-decision-row"><div><div class="fo-decision-label">ENGINE OUTPUT</div><div class="fo-decision-title">{decision}</div><div class="fo-decision-note">{note}</div></div><div class="fo-score-ring"><b>{quality:.0f}</b><span>QUALITY / 100</span></div></div>
+      <div class="fo-decision-grid"><div class="fo-decision-cell"><span>OPTION</span><b>{contract}</b></div><div class="fo-decision-cell"><span>PoP</span><b>{pop:.1f}%</b></div><div class="fo-decision-cell"><span>MARKET</span><b>{regime}</b></div><div class="fo-decision-cell"><span>RISK PROFILE</span><b>{risk_profile.upper()}</b></div></div>
+    </div>
+    """, unsafe_allow_html=True)
 
-        if result[
-            "safety"
-        ]["safe"]:
+    # OPTION / TRADE PLAN
+    if selected:
+        st.markdown("<div class='fo-section'>SELECTED OPTION</div>", unsafe_allow_html=True)
+        selected_html=f"""<div class='fo-card-grid'>
+          <div class='fo-card'><div class='fo-card-label'>OPTION TYPE</div><div class='fo-card-value'>{selected.get('option_type','—')}</div></div>
+          <div class='fo-card'><div class='fo-card-label'>STRIKE</div><div class='fo-card-value'>{fmt_money(selected.get('strike'))}</div></div>
+          <div class='fo-card'><div class='fo-card-label'>PREMIUM</div><div class='fo-card-value'>{fmt_money(selected.get('ltp'))}</div></div>
+          <div class='fo-card'><div class='fo-card-label'>LOT SIZE</div><div class='fo-card-value'>{fmt_number(selected.get('lot_size'),0)}</div></div>
+          <div class='fo-card'><div class='fo-card-label'>DELTA</div><div class='fo-card-value'>{fmt_number(selected.get('delta'),3)}</div></div>
+          <div class='fo-card'><div class='fo-card-label'>IV</div><div class='fo-card-value'>{fmt_number(selected.get('iv'),2)}%</div></div>
+          <div class='fo-card'><div class='fo-card-label'>OPTION PoP</div><div class='fo-card-value'>{fmt_number(selected.get('pop'),1)}%</div></div>
+          <div class='fo-card'><div class='fo-card-label'>OI</div><div class='fo-card-value'>{fmt_number(selected.get('oi'),0)}</div></div>
+        </div>"""
+        st.markdown(selected_html, unsafe_allow_html=True)
 
-            st.success(
-                "Passed the additional beginner "
-                "safety checks. This still does "
-                "not guarantee a profitable trade."
-            )
-
-        else:
-
-            st.error(
-                "Did not pass all beginner safety "
-                "checks. Treat this as WAIT / "
-                "NO TRADE until conditions improve."
-            )
-
-        for (
-            status,
-            title,
-            message
-        ) in result[
-            "safety"
-        ]["checks"]:
-
-            if status == "PASS":
-
-                st.success(
-                    f"**{title} — PASS**\n\n"
-                    f"{message}"
-                )
-
-            elif status == "WAIT":
-
-                st.warning(
-                    f"**{title} — WAIT**\n\n"
-                    f"{message}"
-                )
-
+    if decision in {"CALL BUY","PUT BUY"} and selected:
+        st.markdown("<div class='fo-section'>SELECTED TRADE PLAN</div>", unsafe_allow_html=True)
+        entry=safe_float(plan.get("entry")); qty=safe_float(plan.get("lot"),safe_float(selected.get("lot_size"),1))
+        levels=[("ENTRY",plan.get("entry"),"Option premium","entry"),("STOP LOSS",plan.get("sl"),"Defined risk level","sl"),("TARGET 1",plan.get("t1"),"First profit level","t1"),("TARGET 2",plan.get("t2"),"Second profit level","t2"),("TARGET 3",plan.get("t3"),"Third profit level","t3"),("TARGET 4",plan.get("t4"),"Fourth profit level","t4"),("DELTA / IV",f"{safe_float(selected.get('delta')):.2f} / {safe_float(selected.get('iv')):.1f}%","Option characteristics","greeks")]
+        def level_note(v):
+            v=safe_float(v)
+            if not np.isfinite(entry) or entry==0 or not np.isfinite(v): return ("—","—")
+            delta=v-entry; pct=delta/abs(entry)*100; pnl=delta*qty
+            return (f"{pct:+.2f}% from entry",f"₹{pnl:+,.0f} for 1 lot")
+        cards="<div class='fo-plan-head'><div><div class='fo-plan-action'>SELECTED STRATEGY</div><div class='fo-plan-contract'>{decision} · {contract}</div></div><div class='fo-plan-pop'>PoP {pop:.1f}%</div></div><div class='fo-levels'>"
+        for title,value,note_text,cls in levels:
+            if cls=="greeks": pct_html=""; lot_html=""
             else:
+                pct,lot=level_note(value); pct_html=f"<small class='fo-level-pct'>{pct}</small>"; lot_html=f"<small class='fo-level-lot'>{lot}</small>"
+            cards += f"<div class='fo-level {cls}'><span>{title}</span><b>{fmt_money(value) if cls!='greeks' else value}</b><small>{note_text}</small>{pct_html}{lot_html}</div>"
+        cards += "</div>"
+        st.markdown(cards,unsafe_allow_html=True)
+        st.markdown(f"<div class='fo-risk-box'><div class='fo-risk-cell'><span>PLANNED MAX LOSS · 1 LOT</span><b>{fmt_money(plan.get('max_loss'))}</b></div><div class='fo-risk-cell'><span>TARGET 1 · 1 LOT</span><b>{fmt_money(plan.get('t1_pnl'))}</b></div><div class='fo-risk-cell'><span>TARGET 2 · 1 LOT</span><b>{fmt_money(plan.get('t2_pnl'))}</b></div><div class='fo-risk-cell'><span>TARGET 3 · 1 LOT</span><b>{fmt_money(plan.get('t3_pnl'))}</b></div><div class='fo-risk-cell'><span>TARGET 4 · 1 LOT</span><b>{fmt_money(plan.get('t4_pnl'))}</b></div></div>",unsafe_allow_html=True)
+        st.markdown(f"<div class='fo-why' style='margin-top:10px'><div class='fo-why-line'><b>EXIT RULE:</b> {plan.get('exit','Follow stop-loss and targets.')}</div><div class='fo-why-line'>Risk/Reward: T1 {safe_float(plan.get('rr1'),0):.2f}R · T2 {safe_float(plan.get('rr2'),0):.2f}R · T3 {safe_float(plan.get('t3'),0)-entry if np.isfinite(entry) else 0:.2f} premium move · T4 {safe_float(plan.get('t4'),0)-entry if np.isfinite(entry) else 0:.2f} premium move.</div></div>",unsafe_allow_html=True)
+        st.caption(f"PoP source: {plan.get('pop_source','Model')}. PoP is informational and is not a guarantee of profit.")
+    else:
+        st.markdown("<div class='fo-why'><div class='fo-why-line'>⛔ No executable trade plan is displayed because the current setup did not pass the backend quality and safety gates.</div></div>",unsafe_allow_html=True)
 
-                st.error(
-                    f"**{title} — STOP**\n\n"
-                    f"{message}"
-                )
+    # BEGINNER CHECKS
+    if beginner_mode:
+        st.markdown("<div class='fo-section'>BEGINNER TRADE CHECK</div>", unsafe_allow_html=True)
+        safe=result.get("safety",{}); checks=safe.get("checks",[])
+        if checks:
+            html="<div class='fo-check-grid'>"
+            for status,title,message in checks:
+                st_class={"PASS":"pass","WAIT":"wait","STOP":"fail"}.get(status,"wait")
+                html+=f"<div class='fo-check {st_class}'><div class='fo-check-top'><div class='fo-check-name'>{title}</div><div class='fo-check-status'>{status}</div></div><div class='fo-check-detail'>{message}</div></div>"
+            html+="</div>"; st.markdown(html,unsafe_allow_html=True)
+        else:
+            st.markdown("<div class='fo-why'><div class='fo-why-line'>No beginner safety checks were returned.</div></div>",unsafe_allow_html=True)
 
+    # WHY
+    st.markdown("<div class='fo-section'>WHY THIS DECISION?</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='fo-why'><div class='fo-why-line'>{plan.get('reason','No additional explanation available.')}</div></div>",unsafe_allow_html=True)
 
-    # ============================================================
     # OPTION SNAPSHOT
-    # ============================================================
+    st.markdown("<div class='fo-section'>MCX OPTION SNAPSHOT</div>", unsafe_allow_html=True)
+    display=option_df[["option_type","strike","ltp","oi","volume","iv","delta","pop"]].copy().rename(columns={"option_type":"Type","strike":"Strike","ltp":"LTP","oi":"OI","volume":"Volume","iv":"IV","delta":"Delta","pop":"PoP"})
+    st.dataframe(display.sort_values(["Strike","Type"]),use_container_width=True,hide_index=True)
 
-    st.markdown(
-        "## 📋 MCX Option Snapshot"
-    )
-
-    display = option_df[
-        [
-            "option_type",
-            "strike",
-            "ltp",
-            "oi",
-            "volume",
-            "iv",
-            "delta",
-            "pop"
-        ]
-    ].copy()
-
-    display = display.rename(
-        columns={
-            "option_type": "Type",
-            "strike": "Strike",
-            "ltp": "LTP",
-            "oi": "OI",
-            "volume": "Volume",
-            "iv": "IV",
-            "delta": "Delta",
-            "pop": "PoP",
-        }
-    )
-
-    st.dataframe(
-        display.sort_values(
-            [
-                "Strike",
-                "Type"
-            ]
-        ),
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-    # ============================================================
     # TECHNICALS
-    # ============================================================
+    st.markdown("<div class='fo-section'>UNDERLYING TECHNICAL ANALYSIS</div>", unsafe_allow_html=True)
+    for label,analysis in [("5 Minute",result["analysis_5m"]),("30 Minute",result["analysis_30m"]),("Daily",result["analysis_daily"])]:
+        with st.expander(label,expanded=True):
+            vals=[("TREND",analysis.get("trend","UNKNOWN")),("SCORE",f"{analysis.get('score',0)}/100"),("RSI",fmt_number(analysis.get("rsi"),1)),("ADX",fmt_number(analysis.get("adx"),1)),("ATR",fmt_money(analysis.get("atr"))), ("EMA20",fmt_money(analysis.get("ema20"))), ("EMA50",fmt_money(analysis.get("ema50"))), ("VWAP",fmt_money(analysis.get("vwap")))]
+            html="<div class='fo-card-grid'>"+"".join(f"<div class='fo-card'><div class='fo-card-label'>{k}</div><div class='fo-card-value'>{v}</div></div>" for k,v in vals)+"</div>"
+            st.markdown(html,unsafe_allow_html=True)
 
-    st.markdown(
-        "## 📈 Underlying Technical Analysis"
-    )
+    if result.get("technical_errors"):
+        st.warning("Some underlying technical data was temporarily unavailable. The option analysis was still completed using the data returned by Upstox.")
 
-    technical_sets = [
-        (
-            "5 Minute",
-            result["analysis_5m"]
-        ),
-        (
-            "30 Minute",
-            result["analysis_30m"]
-        ),
-        (
-            "Daily",
-            result["analysis_daily"]
-        ),
-    ]
+    st.markdown("<div class='fo-footer'>MCX OPTION-ONLY MODE · No MCX futures are resolved or traded. MCX CE/PE contracts are discovered directly through Upstox Instrument Search. The option contract's underlying_key is used only for underlying price and technical analysis. Data source: Upstox.</div>",unsafe_allow_html=True)
 
-    for label, analysis in technical_sets:
-
-        with st.expander(
-            label,
-            expanded=True
-        ):
-
-            c1, c2, c3, c4, c5 = st.columns(5)
-
-            c1.metric(
-                "Trend",
-                analysis.get(
-                    "trend",
-                    "UNKNOWN"
-                )
-            )
-
-            c2.metric(
-                "Score",
-                f"{analysis.get('score', 0)}/100"
-            )
-
-            c3.metric(
-                "RSI",
-                fmt_number(
-                    analysis.get(
-                        "rsi"
-                    ),
-                    1
-                )
-            )
-
-            c4.metric(
-                "ADX",
-                fmt_number(
-                    analysis.get(
-                        "adx"
-                    ),
-                    1
-                )
-            )
-
-            c5.metric(
-                "ATR",
-                fmt_money(
-                    analysis.get(
-                        "atr"
-                    )
-                )
-            )
-
-            c1, c2, c3 = st.columns(3)
-
-            c1.metric(
-                "EMA20",
-                fmt_money(
-                    analysis.get(
-                        "ema20"
-                    )
-                )
-            )
-
-            c2.metric(
-                "EMA50",
-                fmt_money(
-                    analysis.get(
-                        "ema50"
-                    )
-                )
-            )
-
-            c3.metric(
-                "VWAP",
-                fmt_money(
-                    analysis.get(
-                        "vwap"
-                    )
-                )
-            )
-
-
-    # ============================================================
-    # TECHNICAL DATA WARNINGS
-    # ============================================================
-
-    technical_errors = result.get(
-        "technical_errors",
-        []
-    )
-
-    if technical_errors:
-
-        st.warning(
-            "Some underlying technical data "
-            "was temporarily unavailable. "
-            "The option analysis was still "
-            "completed using the data that "
-            "Upstox returned."
-        )
-
-
-    # ============================================================
-    # IMPORTANT
-    # ============================================================
-
-    st.markdown(
-        "## ℹ️ Important"
-    )
-
-    st.caption(
-        "This is an MCX OPTION-ONLY application. "
-        "It does not resolve an MCX futures "
-        "contract for trading."
-    )
-
-    st.caption(
-        "MCX CE/PE contracts are discovered "
-        "directly through Upstox Instrument Search."
-    )
-
-    st.caption(
-        "The option contract's underlying_key "
-        "is used only for underlying price and "
-        "technical analysis."
-    )
-
-    st.caption(
-        "Upstox currently documents the standard "
-        "Put/Call Option Chain endpoint as "
-        "unavailable for MCX. Therefore this "
-        "application reconstructs the option view "
-        "from individual MCX CE/PE contracts, "
-        "live quotes and Option Greek data."
-    )
-
-    st.caption(
-        "Last analysis: "
-        f"{result.get('analysis_time', '—')} IST"
-    )
-
-    st.caption(
-        "Data source: Upstox."
-    )
