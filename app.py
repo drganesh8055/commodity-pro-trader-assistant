@@ -17,6 +17,8 @@
 
 import time
 import threading
+import gzip
+import json
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Any
@@ -236,65 +238,106 @@ def api_get(
         ) from exc
 
 
-# ================================================================
-# DIRECT MCX OPTION SEARCH
-#
-# IMPORTANT:
-# There is NO futures resolution here.
-# ================================================================
+@st.cache_data(ttl=900, show_spinner=False)
+def load_mcx_instrument_master():
+    """Load Upstox official MCX BOD instrument master.
 
-@st.cache_data(
-    ttl=90,
-    show_spinner=False
-)
-def _search_instrument_rows(query, instrument_type=None, expiry=None):
+    This is used as the primary discovery source because MCX commodity
+    option availability can be inconsistent when discovered through the
+    free-text Instrument Search API. The master contains the actual live
+    MCX_FO CE/PE contracts and their underlying_key values.
+
+    IMPORTANT: only CE/PE rows are ever returned by the filtering layer;
+    futures are never selected or used for trading.
     """
-    Search Upstox Instrument Search API.
+    url = "https://assets.upstox.com/market-quote/instruments/exchange/MCX.json.gz"
 
-    MCX option discovery is deliberately broad:
-    - MCX only
-    - FO only
-    - CE/PE only when requested
-    - no futures are selected
-    - expiry is optional because MCX commodity option expiry
-      availability can differ by contract.
+    try:
+        response = requests.get(url, timeout=45)
+        response.raise_for_status()
+        raw = response.content
 
-    The returned rows are filtered again locally.
-    """
-    params = {
-        "query": query,
-        "exchanges": "MCX",
-        "segments": "FO",
-        "page_number": 1,
-        "records": 30,
-    }
+        try:
+            raw = gzip.decompress(raw)
+        except (OSError, gzip.BadGzipFile):
+            # Some environments/proxies transparently decompress the file.
+            pass
 
-    if instrument_type:
-        params["instrument_types"] = instrument_type
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, list):
+            raise RuntimeError("Upstox MCX instrument master returned an unexpected format.")
 
-    if expiry:
-        params["expiry"] = expiry
-
-    payload = api_get(
-        "/v2/instruments/search",
-        params=params,
-        timeout=30,
-    )
-
-    data = payload.get("data", [])
-    return data if isinstance(data, list) else []
+        return payload
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Unable to download the Upstox MCX instrument master: {exc}") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Upstox MCX instrument master could not be decoded.") from exc
 
 
-@st.cache_data(ttl=90, show_spinner=False)
+def _row_commodity_matches(row, symbol):
+    if not isinstance(row, dict):
+        return False
+
+    target = normalize_text(symbol)
+
+    fields = [
+        normalize_text(row.get("underlying_symbol", "")),
+        normalize_text(row.get("name", "")),
+        normalize_text(row.get("short_name", "")),
+    ]
+
+    # Exact underlying/name matches first. This prevents SILVER from
+    # accidentally selecting SILVERM contracts.
+    if target and any(value == target for value in fields if value):
+        return True
+
+    trading = normalize_text(row.get("trading_symbol", ""))
+    return bool(target and trading.startswith(target + " "))
+
+
+def _master_mcx_options(symbol):
+    """Return active MCX CE/PE rows for one commodity from the BOD master."""
+    symbol = normalize_symbol(symbol)
+    today = date.today().isoformat()
+    rows = []
+
+    for row in load_mcx_instrument_master():
+        if not isinstance(row, dict):
+            continue
+
+        if str(row.get("exchange", "")).upper() != "MCX":
+            continue
+        if str(row.get("segment", "")).upper() != "MCX_FO":
+            continue
+        if str(row.get("instrument_type", "")).upper() not in {"CE", "PE"}:
+            continue
+        if not _row_commodity_matches(row, symbol):
+            continue
+
+        key = str(row.get("instrument_key", "")).strip()
+        underlying_key = str(row.get("underlying_key", "")).strip()
+        expiry = expiry_string(row.get("expiry"))
+        strike = safe_float(row.get("strike_price"))
+
+        if not key or not underlying_key or not expiry or expiry < today:
+            continue
+        if not np.isfinite(strike):
+            continue
+
+        rows.append(row)
+
+    return rows
+
+
+@st.cache_data(ttl=120, show_spinner=False)
 def search_mcx_options(symbol, option_type, expiry_keyword=None):
-    """
-    Robust MCX CE/PE discovery.
+    """Discover MCX CE/PE contracts without resolving any future.
 
-    Important:
-    We never ask Upstox for FUT and never return FUT rows.
-    We search using several harmless textual variants because
-    Upstox may index commodity names as CRUDE, CRUDE OIL,
-    CRUDEOIL, etc.
+    Primary source: official Upstox MCX instrument master.
+    Secondary source: Upstox Instrument Search API.
+
+    The master-first approach fixes cases such as SILVER where the
+    free-text search may not return the active MCX option series.
     """
     symbol = normalize_symbol(symbol)
     option_type = str(option_type or "").upper().strip()
@@ -302,19 +345,41 @@ def search_mcx_options(symbol, option_type, expiry_keyword=None):
     if option_type not in ("CE", "PE"):
         return []
 
-    # Text variants. The API supports partial, case-insensitive search.
+    # ------------------------------------------------------------
+    # PRIMARY: official MCX instrument master
+    # ------------------------------------------------------------
+    try:
+        master_rows = [
+            row for row in _master_mcx_options(symbol)
+            if str(row.get("instrument_type", "")).upper() == option_type
+        ]
+
+        if master_rows:
+            if expiry_keyword:
+                # Instrument-master rows have real expiry dates, so apply
+                # relative expiry keywords locally instead of relying on
+                # the search API's interpretation for MCX.
+                expiries = sorted({expiry_string(r.get("expiry")) for r in master_rows})
+                selected_expiry = _select_expiry_for_keyword(expiries, expiry_keyword)
+                if selected_expiry:
+                    filtered = [r for r in master_rows if expiry_string(r.get("expiry")) == selected_expiry]
+                    if filtered:
+                        return filtered
+            return master_rows
+    except Exception:
+        # Fall through to the supported search API.
+        pass
+
+    # ------------------------------------------------------------
+    # SECONDARY: Instrument Search API
+    # ------------------------------------------------------------
     variants = {
         "GOLD": ["GOLD"],
         "GOLDM": ["GOLDM", "GOLD MINI", "GOLD"],
         "SILVER": ["SILVER"],
         "SILVERM": ["SILVERM", "SILVER MINI", "SILVER"],
         "CRUDEOIL": ["CRUDEOIL", "CRUDE OIL", "CRUDE"],
-        "CRUDEOILMINI": [
-            "CRUDEOILMINI",
-            "CRUDE OIL MINI",
-            "CRUDE MINI",
-            "CRUDE",
-        ],
+        "CRUDEOILMINI": ["CRUDEOILMINI", "CRUDE OIL MINI", "CRUDE MINI", "CRUDE"],
         "NATURALGAS": ["NATURALGAS", "NATURAL GAS", "NAT GAS", "NATGAS"],
         "COPPER": ["COPPER"],
         "ZINC": ["ZINC"],
@@ -324,70 +389,82 @@ def search_mcx_options(symbol, option_type, expiry_keyword=None):
     }.get(symbol, [symbol])
 
     rows = []
-
-    # First pass: specific option type + optional expiry.
     for query in variants:
         try:
-            rows.extend(
-                _search_instrument_rows(
-                    query,
-                    instrument_type=option_type,
-                    expiry=expiry_keyword,
-                )
-            )
+            rows.extend(_search_instrument_rows(query, instrument_type=option_type, expiry=expiry_keyword))
         except Exception:
             continue
 
-    # Second pass: if an expiry-filtered search returned nothing,
-    # search without expiry and filter dates locally.
     if not rows:
         for query in variants:
             try:
-                rows.extend(
-                    _search_instrument_rows(
-                        query,
-                        instrument_type=option_type,
-                        expiry=None,
-                    )
-                )
+                rows.extend(_search_instrument_rows(query, instrument_type=option_type, expiry=None))
             except Exception:
                 continue
 
-    # Final safety filter: only MCX_FO + requested CE/PE.
     cleaned = []
     seen = set()
-
     for row in rows:
         if not isinstance(row, dict):
             continue
-
-        exchange = str(row.get("exchange", "")).upper()
-        segment = str(row.get("segment", "")).upper()
-        inst_type = str(row.get("instrument_type", "")).upper()
-
-        if exchange != "MCX":
+        if str(row.get("exchange", "")).upper() != "MCX":
             continue
-
-        if segment != "MCX_FO":
+        if str(row.get("segment", "")).upper() != "MCX_FO":
             continue
-
-        if inst_type != option_type:
+        if str(row.get("instrument_type", "")).upper() != option_type:
             continue
-
+        if not _row_commodity_matches(row, symbol):
+            continue
         key = str(row.get("instrument_key", "")).strip()
-
         if not key or key in seen:
             continue
-
-        # Explicitly reject anything that looks like a future.
-        trading_symbol = str(row.get("trading_symbol", "")).upper()
-        if inst_type == "FUT" or " FUT " in f" {trading_symbol} ":
+        if not str(row.get("underlying_key", "")).strip():
             continue
-
+        expiry = expiry_string(row.get("expiry"))
+        if not expiry or expiry < date.today().isoformat():
+            continue
         seen.add(key)
         cleaned.append(row)
 
     return cleaned
+
+
+def _select_expiry_for_keyword(expiries, keyword):
+    """Map Upstox-style relative expiry keywords to actual MCX dates."""
+    valid = sorted(str(x) for x in expiries if x)
+    if not valid:
+        return ""
+
+    today = date.today()
+    future = []
+    for value in valid:
+        try:
+            d = date.fromisoformat(value)
+        except ValueError:
+            continue
+        if d >= today:
+            future.append(d)
+
+    if not future:
+        return ""
+
+    key = str(keyword or "").lower().strip()
+    if key in {"current_month", "this_month", "near_month", "monthly"}:
+        same_month = [d for d in future if d.year == today.year and d.month == today.month]
+        return min(same_month).isoformat() if same_month else min(future).isoformat()
+    if key in {"next_month", "far_month"}:
+        next_month = [d for d in future if (d.year, d.month) > (today.year, today.month)]
+        return min(next_month).isoformat() if next_month else min(future).isoformat()
+    if key in {"current_week", "this_week", "near_week", "weekly", "next_week", "far_week"}:
+        return min(future).isoformat()
+
+    # Specific date is also accepted.
+    try:
+        requested = date.fromisoformat(key)
+        candidates = [d for d in future if d == requested]
+        return requested.isoformat() if candidates else ""
+    except ValueError:
+        return ""
 
 def option_matches_commodity(
     row,
@@ -453,10 +530,24 @@ def option_matches_commodity(
 
 
 def expiry_string(value):
-    if not value:
+    if value is None or value == "":
         return ""
 
-    return str(value)[:10]
+    # Current Instrument Search responses use YYYY-MM-DD strings, while
+    # the downloadable BOD instrument master may contain epoch milliseconds.
+    if isinstance(value, (int, float)) and np.isfinite(float(value)):
+        try:
+            ts = float(value)
+            if ts > 10_000_000_000:
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(ts, tz=IST).date().isoformat()
+        except Exception:
+            pass
+
+    text = str(value).strip()
+    if not text:
+        return ""
+    return text[:10]
 
 
 def clean_options(
