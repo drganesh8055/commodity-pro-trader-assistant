@@ -901,6 +901,15 @@ def parse_quote(value):
             sell[0].get("price")
         )
 
+    # Upstox V3 full quotes expose the previous session close at the
+    # top level as prev_close_price. Keep the older OHLC close as a
+    # fallback for compatibility.
+    prev_close_price = safe_float(
+        value.get("prev_close_price")
+    )
+    if not np.isfinite(prev_close_price):
+        prev_close_price = safe_float(ohlc.get("close"))
+
     return {
         "ltp": safe_float(
             value.get("last_price")
@@ -922,8 +931,11 @@ def parse_quote(value):
             ohlc.get("close")
         ),
 
-        "previous_close": safe_float(
-            ohlc.get("close")
+        "previous_close": prev_close_price,
+
+        "change": safe_float(
+            value.get("net_change"),
+            np.nan
         ),
 
         "volume": safe_float(
@@ -1054,15 +1066,14 @@ def build_option_dataframe(
             volume = greek["volume"]
 
         lot_size = safe_float(
-            contract.get(
-                "lot_size",
-                contract.get(
-                    "minimum_lot",
-                    1
-                )
-            ),
-            1
+            contract.get("lot_size"),
+            np.nan
         )
+        if not np.isfinite(lot_size) or lot_size <= 0:
+            lot_size = safe_float(
+                contract.get("minimum_lot"),
+                np.nan
+            )
 
         rows.append({
             "instrument_key": key,
@@ -2627,6 +2638,48 @@ if "commodity_result" not in st.session_state:
 
 
 # ================================================================
+# REFERENCE DATA HELPERS
+# ================================================================
+def reference_lot_size(option_df, selected_option=None):
+    """Return the actual MCX option lot size from contract metadata.
+
+    This is intentionally independent of the trade decision: LOT SIZE
+    must remain visible even when the engine returns NO TRADE.
+    """
+    if isinstance(selected_option, dict):
+        value = safe_float(selected_option.get("lot_size"), np.nan)
+        if np.isfinite(value) and value > 0:
+            return value
+
+    if isinstance(option_df, pd.DataFrame) and not option_df.empty and "lot_size" in option_df.columns:
+        values = pd.to_numeric(option_df["lot_size"], errors="coerce")
+        values = values[np.isfinite(values) & (values > 0)]
+        if not values.empty:
+            # All CE/PE contracts in one expiry normally share the same lot.
+            # Use the most common value if the master contains any anomalies.
+            mode = values.mode()
+            return safe_float(mode.iloc[0] if not mode.empty else values.iloc[0], np.nan)
+
+    return np.nan
+
+
+def reference_spot(underlying_price, underlying_quote):
+    """Return live underlying price, falling back to previous close only
+    when the market-quote endpoint has no current LTP.
+    """
+    live = safe_float(underlying_price, np.nan)
+    if np.isfinite(live) and live > 0:
+        return live, "Live underlying LTP"
+
+    prev = safe_float((underlying_quote or {}).get("previous_close"), np.nan)
+    if np.isfinite(prev) and prev > 0:
+        return prev, "Previous session close"
+
+    return np.nan, "Unavailable"
+
+
+
+# ================================================================
 # ANALYZE
 # ================================================================
 
@@ -2873,6 +2926,11 @@ if analyze_button:
                 )
             )
 
+            reference_lot = reference_lot_size(
+                option_df,
+                selected_option
+            )
+
             # ----------------------------------------------------
             # SAVE
             # ----------------------------------------------------
@@ -2895,6 +2953,9 @@ if analyze_button:
 
                 "underlying_price":
                     underlying_price,
+
+                "reference_lot_size":
+                    reference_lot,
 
                 "analysis_5m":
                     analysis_5m,
@@ -3023,18 +3084,23 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
-    spot = safe_float(underlying_price)
-    prev = safe_float(underlying_quote.get("previous_close"), spot)
-    day_change = safe_float(underlying_quote.get("change"), spot - prev if np.isfinite(prev) else 0)
-    day_pct = day_change / prev * 100 if np.isfinite(prev) and prev else 0
+    spot, spot_source = reference_spot(underlying_price, underlying_quote)
+    prev = safe_float(underlying_quote.get("previous_close"), np.nan)
+    if np.isfinite(spot) and np.isfinite(prev) and prev > 0:
+        day_change = spot - prev
+        day_pct = day_change / prev * 100
+    else:
+        day_change = np.nan
+        day_pct = np.nan
+    lot_display = safe_float(result.get("reference_lot_size"), np.nan)
     metrics = [
-        ("SPOT", fmt_money(spot), f"{day_change:+.2f} ({day_pct:+.2f}%)", "spot"),
+        ("SPOT", fmt_money(spot), (f"{day_change:+.2f} ({day_pct:+.2f}%)" if np.isfinite(day_change) and np.isfinite(day_pct) else spot_source), "spot"),
         ("EXPIRY", resolved.get("expiry","—"), "Nearest active option expiry", ""),
-        ("PCR", fmt_number(structure.get("pcr"),2), "Put / Call OI", ""),
+        ("PCR", fmt_number(structure.get("pcr"),2), "Put OI / Call OI", ""),
         ("SUPPORT", fmt_number(structure.get("support"),2), "Put OI zone", "support"),
         ("RESISTANCE", fmt_number(structure.get("resistance"),2), "Call OI zone", "resistance"),
         ("OPTIONS", str(len(option_df)), "Active CE + PE contracts", ""),
-        ("LOT SIZE", fmt_number(selected.get("lot_size") if selected else np.nan,0), "1 option lot", ""),
+        ("LOT SIZE", fmt_number(lot_display,0), "Actual MCX option lot", ""),
     ]
     html="<div class='fo-metrics'>"
     for title,value,note,cls in metrics:
