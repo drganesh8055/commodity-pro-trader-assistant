@@ -247,23 +247,33 @@ def api_get(
     ttl=90,
     show_spinner=False
 )
-def search_mcx_options(
-    symbol,
-    option_type,
-    expiry_keyword
-):
+def _search_instrument_rows(query, instrument_type=None, expiry=None):
+    """
+    Search Upstox Instrument Search API.
 
-    symbol = normalize_symbol(symbol)
+    MCX option discovery is deliberately broad:
+    - MCX only
+    - FO only
+    - CE/PE only when requested
+    - no futures are selected
+    - expiry is optional because MCX commodity option expiry
+      availability can differ by contract.
 
+    The returned rows are filtered again locally.
+    """
     params = {
-        "query": symbol,
+        "query": query,
         "exchanges": "MCX",
         "segments": "FO",
-        "instrument_types": option_type,
-        "expiry": expiry_keyword,
         "page_number": 1,
         "records": 30,
     }
+
+    if instrument_type:
+        params["instrument_types"] = instrument_type
+
+    if expiry:
+        params["expiry"] = expiry
 
     payload = api_get(
         "/v2/instruments/search",
@@ -271,16 +281,113 @@ def search_mcx_options(
         timeout=30,
     )
 
-    data = payload.get(
-        "data",
-        []
-    )
+    data = payload.get("data", [])
+    return data if isinstance(data, list) else []
 
-    if not isinstance(data, list):
+
+@st.cache_data(ttl=90, show_spinner=False)
+def search_mcx_options(symbol, option_type, expiry_keyword=None):
+    """
+    Robust MCX CE/PE discovery.
+
+    Important:
+    We never ask Upstox for FUT and never return FUT rows.
+    We search using several harmless textual variants because
+    Upstox may index commodity names as CRUDE, CRUDE OIL,
+    CRUDEOIL, etc.
+    """
+    symbol = normalize_symbol(symbol)
+    option_type = str(option_type or "").upper().strip()
+
+    if option_type not in ("CE", "PE"):
         return []
 
-    return data
+    # Text variants. The API supports partial, case-insensitive search.
+    variants = {
+        "GOLD": ["GOLD"],
+        "GOLDM": ["GOLDM", "GOLD MINI", "GOLD"],
+        "SILVER": ["SILVER"],
+        "SILVERM": ["SILVERM", "SILVER MINI", "SILVER"],
+        "CRUDEOIL": ["CRUDEOIL", "CRUDE OIL", "CRUDE"],
+        "CRUDEOILMINI": [
+            "CRUDEOILMINI",
+            "CRUDE OIL MINI",
+            "CRUDE MINI",
+            "CRUDE",
+        ],
+        "NATURALGAS": ["NATURALGAS", "NATURAL GAS", "NAT GAS", "NATGAS"],
+        "COPPER": ["COPPER"],
+        "ZINC": ["ZINC"],
+        "ALUMINIUM": ["ALUMINIUM", "ALUMINUM"],
+        "LEAD": ["LEAD"],
+        "NICKEL": ["NICKEL"],
+    }.get(symbol, [symbol])
 
+    rows = []
+
+    # First pass: specific option type + optional expiry.
+    for query in variants:
+        try:
+            rows.extend(
+                _search_instrument_rows(
+                    query,
+                    instrument_type=option_type,
+                    expiry=expiry_keyword,
+                )
+            )
+        except Exception:
+            continue
+
+    # Second pass: if an expiry-filtered search returned nothing,
+    # search without expiry and filter dates locally.
+    if not rows:
+        for query in variants:
+            try:
+                rows.extend(
+                    _search_instrument_rows(
+                        query,
+                        instrument_type=option_type,
+                        expiry=None,
+                    )
+                )
+            except Exception:
+                continue
+
+    # Final safety filter: only MCX_FO + requested CE/PE.
+    cleaned = []
+    seen = set()
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        exchange = str(row.get("exchange", "")).upper()
+        segment = str(row.get("segment", "")).upper()
+        inst_type = str(row.get("instrument_type", "")).upper()
+
+        if exchange != "MCX":
+            continue
+
+        if segment != "MCX_FO":
+            continue
+
+        if inst_type != option_type:
+            continue
+
+        key = str(row.get("instrument_key", "")).strip()
+
+        if not key or key in seen:
+            continue
+
+        # Explicitly reject anything that looks like a future.
+        trading_symbol = str(row.get("trading_symbol", "")).upper()
+        if inst_type == "FUT" or " FUT " in f" {trading_symbol} ":
+            continue
+
+        seen.add(key)
+        cleaned.append(row)
+
+    return cleaned
 
 def option_matches_commodity(
     row,
@@ -426,123 +533,112 @@ def deduplicate_contracts(rows):
     ttl=90,
     show_spinner=False
 )
+@st.cache_data(ttl=90, show_spinner=False)
 def resolve_mcx_options(symbol):
+    """
+    Resolve the nearest active MCX CE/PE expiry without resolving
+    or trading an MCX future.
 
+    We discover CE and PE directly, then choose the earliest expiry
+    for which both sides exist.
+    """
     symbol = normalize_symbol(symbol)
 
     if not symbol:
-        raise RuntimeError(
-            "Please enter a commodity."
-        )
+        raise RuntimeError("Please enter a commodity.")
 
+    # Do not rely on one expiry keyword. MCX commodity option
+    # availability differs by contract and expiry.
     expiry_attempts = [
         "current_month",
-        "next_month",
+        "this_month",
         "near_month",
-        "next_week",
+        "next_month",
+        None,
     ]
 
-    for expiry_keyword in expiry_attempts:
+    last_error = None
 
+    for expiry_keyword in expiry_attempts:
         all_rows = []
 
-        for option_type in ["CE", "PE"]:
-
+        for option_type in ("CE", "PE"):
             try:
-
                 rows = search_mcx_options(
                     symbol,
                     option_type,
-                    expiry_keyword
+                    expiry_keyword,
                 )
 
                 cleaned = clean_options(
                     rows,
                     symbol,
-                    option_type
+                    option_type,
                 )
 
                 all_rows.extend(cleaned)
 
-            except Exception:
-                continue
+            except Exception as exc:
+                last_error = exc
 
-        all_rows = deduplicate_contracts(
-            all_rows
-        )
+        all_rows = deduplicate_contracts(all_rows)
 
         if not all_rows:
             continue
 
+        # Only future/non-expired dates are allowed.
         expiries = sorted(
             {
-                expiry_string(
-                    row.get("expiry")
-                )
+                expiry_string(row.get("expiry"))
                 for row in all_rows
-                if expiry_string(
-                    row.get("expiry")
-                )
+                if expiry_string(row.get("expiry"))
+                and expiry_string(row.get("expiry")) >= date.today().isoformat()
             }
         )
 
-        if not expiries:
-            continue
+        for selected_expiry in expiries:
+            selected = [
+                row for row in all_rows
+                if expiry_string(row.get("expiry")) == selected_expiry
+            ]
 
-        selected_expiry = expiries[0]
+            ce_count = sum(
+                1 for row in selected
+                if str(row.get("instrument_type", "")).upper() == "CE"
+            )
+            pe_count = sum(
+                1 for row in selected
+                if str(row.get("instrument_type", "")).upper() == "PE"
+            )
 
-        selected = [
-            row
-            for row in all_rows
-            if expiry_string(
-                row.get("expiry")
-            ) == selected_expiry
-        ]
+            if ce_count == 0 or pe_count == 0:
+                continue
 
-        ce_count = sum(
-            1
-            for row in selected
-            if str(
-                row.get("instrument_type", "")
-            ).upper() == "CE"
-        )
+            underlying_key = ""
+            for row in selected:
+                key = str(row.get("underlying_key", "")).strip()
+                if key:
+                    underlying_key = key
+                    break
 
-        pe_count = sum(
-            1
-            for row in selected
-            if str(
-                row.get("instrument_type", "")
-            ).upper() == "PE"
-        )
+            if not underlying_key:
+                continue
 
-        if ce_count == 0 or pe_count == 0:
-            continue
+            return {
+                "symbol": symbol,
+                "expiry": selected_expiry,
+                "underlying_key": underlying_key,
+                "contracts": selected,
+            }
 
-        underlying_key = ""
-
-        for row in selected:
-
-            key = str(
-                row.get("underlying_key", "")
-            ).strip()
-
-            if key:
-                underlying_key = key
-                break
-
-        return {
-            "symbol": symbol,
-            "expiry": selected_expiry,
-            "underlying_key": underlying_key,
-            "contracts": selected,
-        }
+    detail = ""
+    if last_error:
+        detail = f" Upstox detail: {last_error}"
 
     raise RuntimeError(
-        f"Could not find active MCX options for "
-        f"'{symbol}'. "
-        f"Try GOLD, GOLDM, SILVER, SILVERM, "
-        f"CRUDEOIL, CRUDEOILMINI, NATURALGAS, "
-        f"COPPER, ZINC, ALUMINIUM, LEAD or NICKEL."
+        f"Could not find active MCX CE/PE options for '{symbol}'. "
+        f"The app searched MCX_FO directly and excluded futures."
+        f"{detail}"
     )
 
 
