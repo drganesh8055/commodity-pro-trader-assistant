@@ -922,6 +922,10 @@ def parse_quote(value):
             ohlc.get("close")
         ),
 
+        "previous_close": safe_float(
+            ohlc.get("close")
+        ),
+
         "volume": safe_float(
             value.get(
                 "volume",
@@ -2962,6 +2966,19 @@ section[data-testid="stSidebar"] h2{color:#12395b!important;}
 .fo-levels{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:7px;margin-top:9px}.fo-level{background:#fff;border:1px solid #d7e2ee;border-radius:13px;padding:11px 9px;min-height:112px;min-width:0;box-sizing:border-box;overflow:hidden;box-shadow:0 4px 12px rgba(15,23,42,.045)}.fo-level span{display:block;font-size:11px;color:#64748b;font-weight:900;letter-spacing:.45px;white-space:nowrap}.fo-level b{display:block;font-size:18px;color:#182230;margin-top:7px;white-space:nowrap}.fo-level small{display:block;font-size:11px;color:#64748b;margin-top:4px;line-height:1.25}.fo-level.entry{background:linear-gradient(180deg,#eff6ff,#fff);border-top:5px solid #2563eb}.fo-level.sl{background:linear-gradient(180deg,#fff1f2,#fff);border-top:5px solid #dc2626}.fo-level.t1{background:linear-gradient(180deg,#ecfdf5,#fff);border-top:5px solid #16a34a}.fo-level.t2{background:linear-gradient(180deg,#ecfeff,#fff);border-top:5px solid #0f766e}.fo-level.t3{background:linear-gradient(180deg,#ecfdf5,#fff);border-top:5px solid #059669}.fo-level.t4{background:linear-gradient(180deg,#d1fae5,#fff);border-top:5px solid #047857}.fo-level.greeks{background:linear-gradient(180deg,#f5f3ff,#fff);border-top:5px solid #7c3aed}.fo-level-pct{font-weight:900!important;font-size:13px!important}.fo-level-lot{font-weight:900!important;font-size:13px!important}.fo-level.sl .fo-level-pct,.fo-level.sl .fo-level-lot{color:#b91c1c!important}.fo-level.t1 .fo-level-pct,.fo-level.t1 .fo-level-lot,.fo-level.t2 .fo-level-pct,.fo-level.t2 .fo-level-lot,.fo-level.t3 .fo-level-pct,.fo-level.t3 .fo-level-lot,.fo-level.t4 .fo-level-pct,.fo-level.t4 .fo-level-lot{color:#15803d!important}
 .fo-risk-box{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin-top:12px}.fo-risk-cell{background:#fff;border:1px solid #d7e2ee;border-radius:11px;padding:10px;text-align:center}.fo-risk-cell span{display:block;font-size:10px;font-weight:900;color:#64748b}.fo-risk-cell b{display:block;font-size:17px;color:#172b4d;margin-top:4px}.fo-safety-banner{display:flex;align-items:center;justify-content:space-between;gap:14px;background:linear-gradient(135deg,#eff6ff,#f8fbff);border:1px solid #93c5fd;border-left:6px solid #2563eb;border-radius:14px;padding:14px 16px;margin:12px 0 16px}.fo-safety-banner b{font-size:16px;color:#12395b}.fo-safety-banner span{font-size:13px;color:#52657a;display:block;margin-top:3px}.fo-safety-badge{background:#dbeafe;color:#1d4ed8;border:1px solid #93c5fd;padding:7px 10px;border-radius:20px;font-size:12px;font-weight:900}.fo-check-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fo-check{background:#fff;border:2px solid #d7e2ee;border-radius:12px;padding:12px}.fo-check.pass{background:#ecfdf5;border-color:#4ade80}.fo-check.wait{background:#fffbeb;border-color:#fbbf24}.fo-check.fail{background:#fff1f2;border-color:#fb7185}.fo-check-top{display:flex;justify-content:space-between;gap:8px}.fo-check-name{font-weight:900;color:#172b4d}.fo-check-status{font-size:11px;font-weight:900;border-radius:8px;padding:4px 7px}.fo-check.pass .fo-check-status{background:#bbf7d0;color:#166534}.fo-check.wait .fo-check-status{background:#fde68a;color:#92400e}.fo-check.fail .fo-check-status{background:#fecdd3;color:#9f1239}.fo-check-detail{font-size:13px;color:#52657a;line-height:1.45;margin-top:7px}
 .fo-card-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.fo-card{background:#fff;border:1px solid #d7e2ee;border-radius:14px;padding:14px;box-shadow:0 4px 12px rgba(15,23,42,.04)}.fo-card-label{font-size:11px;color:#64748b;font-weight:900}.fo-card-value{font-size:21px;color:#172b4d;font-weight:900;margin-top:5px}.fo-why{background:#fff;border:2px solid #d7e2ee;border-radius:15px;padding:14px 17px;box-shadow:0 3px 12px rgba(16,42,67,.03)}.fo-why-line{padding:8px 2px;border-bottom:1px solid #e2e8f0;font-size:14px;color:#344054;line-height:1.5}.fo-why-line:last-child{border-bottom:0}.fo-footer{margin-top:22px;padding:13px 15px;border-radius:12px;background:linear-gradient(90deg,#e0f2fe,#ecfdf5);border:1px solid #bfdbfe;color:#475569;font-size:12px;line-height:1.6;text-align:center}
+.fo-card-value,.fo-decision-cell b,.fo-plan-contract,.fo-metric-value{overflow-wrap:anywhere;word-break:break-word;white-space:normal!important}
+.fo-decision-cell{min-width:0}.fo-decision-cell b{line-height:1.25}
+.fo-card{min-width:0;min-height:82px}.fo-card-grid{align-items:stretch}
+.fo-snapshot-wrap{width:100%;overflow-x:auto;border:1px solid #d7e2ee;border-radius:14px;background:#fff;box-shadow:0 4px 12px rgba(15,23,42,.04)}
+.fo-snapshot-table{width:100%;min-width:900px;border-collapse:collapse;font-size:13px}
+.fo-snapshot-table th{position:sticky;top:0;background:#eaf3fb;color:#24425f;font-size:11px;font-weight:900;letter-spacing:.45px;padding:10px 9px;border-bottom:2px solid #c7d7ea;text-align:right;white-space:nowrap}
+.fo-snapshot-table th:first-child,.fo-snapshot-table td:first-child{text-align:center}
+.fo-snapshot-table td{padding:9px;border-bottom:1px solid #edf2f7;text-align:right;color:#243b53;white-space:nowrap}
+.fo-snapshot-table tr:last-child td{border-bottom:0}
+.fo-snapshot-table .ce{color:#087f3e;font-weight:900}.fo-snapshot-table .pe{color:#c81e3a;font-weight:900}
+.fo-data-note{margin:8px 2px 0;color:#64748b;font-size:12px}
+@media(max-width:1200px){.fo-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.fo-levels{grid-template-columns:repeat(4,minmax(0,1fr))}}
+
 @media(max-width:1050px){.fo-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.fo-levels{grid-template-columns:repeat(4,minmax(0,1fr))}.fo-card-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:720px){.fo-hero-top,.fo-plan-head,.fo-decision-row{flex-direction:column;align-items:flex-start}.fo-metrics,.fo-levels,.fo-risk-box,.fo-card-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.fo-decision-grid{grid-template-columns:repeat(2,1fr)}.fo-check-grid{grid-template-columns:1fr}.fo-brand{font-size:25px}}
 </style>
@@ -3099,8 +3116,45 @@ else:
 
     # OPTION SNAPSHOT
     st.markdown("<div class='fo-section'>MCX OPTION SNAPSHOT</div>", unsafe_allow_html=True)
-    display=option_df[["option_type","strike","ltp","oi","volume","iv","delta","pop"]].copy().rename(columns={"option_type":"Type","strike":"Strike","ltp":"LTP","oi":"OI","volume":"Volume","iv":"IV","delta":"Delta","pop":"PoP"})
-    st.dataframe(display.sort_values(["Strike","Type"]),use_container_width=True,hide_index=True)
+    # Render the complete option snapshot as a responsive HTML table instead of
+    # the Streamlit dataframe canvas. This prevents columns from being hidden
+    # or compressed when the browser width changes.
+    snap_cols = ["option_type","strike","ltp","oi","volume","iv","delta","pop"]
+    snap = option_df[[c for c in snap_cols if c in option_df.columns]].copy()
+    snap = snap.sort_values(["strike","option_type"]).reset_index(drop=True)
+    headers = {"option_type":"Type","strike":"Strike","ltp":"LTP","oi":"OI","volume":"Volume","iv":"IV %","delta":"Delta","pop":"PoP %"}
+    table = "<div class='fo-snapshot-wrap'><table class='fo-snapshot-table'><thead><tr>"
+    for c in snap.columns:
+        table += f"<th>{headers.get(c,c.upper())}</th>"
+    table += "</tr></thead><tbody>"
+    for _, row in snap.iterrows():
+        typ = str(row.get("option_type","—"))
+        cls = "ce" if typ == "CE" else ("pe" if typ == "PE" else "")
+        table += "<tr>"
+        for c in snap.columns:
+            v = row.get(c)
+            if c == "option_type":
+                txt = typ
+            elif c == "strike":
+                txt = fmt_number(v,2)
+            elif c == "ltp":
+                txt = fmt_money(v)
+            elif c in ("oi","volume"):
+                txt = fmt_number(v,0)
+            elif c == "iv":
+                txt = fmt_number(v,2)
+            elif c == "delta":
+                txt = fmt_number(v,3)
+            elif c == "pop":
+                txt = fmt_number(v,1) + "%" if np.isfinite(safe_float(v)) else "—"
+            else:
+                txt = str(v)
+            cell_cls = f" class='{cls}'" if c == "option_type" else ""
+            table += f"<td{cell_cls}>{txt}</td>"
+        table += "</tr>"
+    table += "</tbody></table></div>"
+    st.markdown(table, unsafe_allow_html=True)
+    st.markdown(f"<div class='fo-data-note'>Showing all {len(snap)} active CE/PE contracts for the selected expiry. Scroll horizontally only if your screen is narrower than the full table.</div>", unsafe_allow_html=True)
 
     # TECHNICALS
     st.markdown("<div class='fo-section'>UNDERLYING TECHNICAL ANALYSIS</div>", unsafe_allow_html=True)
@@ -3113,5 +3167,5 @@ else:
     if result.get("technical_errors"):
         st.warning("Some underlying technical data was temporarily unavailable. The option analysis was still completed using the data returned by Upstox.")
 
-    st.markdown("<div class='fo-footer'>MCX OPTION-ONLY MODE · No MCX futures are resolved or traded. MCX CE/PE contracts are discovered directly through Upstox Instrument Search. The option contract's underlying_key is used only for underlying price and technical analysis. Data source: Upstox.</div>",unsafe_allow_html=True)
+    st.markdown("<div class='fo-footer'>MCX OPTION-ONLY MODE · No MCX futures are resolved or traded. MCX CE/PE contracts are discovered from the official Upstox MCX instrument master with Instrument Search as fallback. The option contract's underlying_key is used only for underlying price and technical analysis. Data source: Upstox.</div>",unsafe_allow_html=True)
 
